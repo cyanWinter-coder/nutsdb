@@ -151,15 +151,10 @@ func TestService_ProcessExpirationEvents_FlushOnStop(t *testing.T) {
 
 	eventsReceived := make([]*ExpirationEvent, 0)
 	var mu sync.Mutex
-	received := make(chan struct{}, 1)
 	callback := func(events []*ExpirationEvent) {
 		mu.Lock()
 		eventsReceived = append(eventsReceived, events...)
 		mu.Unlock()
-		select {
-		case received <- struct{}{}:
-		default:
-		}
 	}
 
 	service := NewService(mockClock, config, callback)
@@ -175,13 +170,11 @@ func TestService_ProcessExpirationEvents_FlushOnStop(t *testing.T) {
 	service.queue.push(event)
 
 	service.queue.close()
-	require.NoError(t, service.Stop(100*time.Millisecond))
-
-	select {
-	case <-received:
-	case <-time.After(1 * time.Second):
-		t.Fatal("expected expiration events after stop")
-	}
+	// Stop waits for the processor goroutine, which always flushes its
+	// pending batch on the closed-channel path before returning. Use the same
+	// generous timeout production code (db.Close) uses, so a delayed schedule
+	// of the worker cannot turn into a flaky assertion.
+	require.NoError(t, service.Stop(5*time.Second))
 
 	mu.Lock()
 	assert.GreaterOrEqual(t, len(eventsReceived), 1)

@@ -76,7 +76,7 @@ func runTTLScenario(b *testing.B, sc ttlBenchScenario) {
 				service.RegisterKeyForActiveExpiration(bucketId, key, ds, sc.ttlSeconds, timestamp)
 			}
 			for _, key := range keys {
-				service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, key, ds, timestamp), 0)
+				service.wheelManager.fireExpirationForTest(bucketId, key)
 			}
 		} else {
 			record := &core.Record{TTL: sc.ttlSeconds, Timestamp: timestamp}
@@ -245,7 +245,7 @@ func BenchmarkTTL_WheelSlotDuration(b *testing.B) {
 					service.RegisterKeyForActiveExpiration(bucketId, key, ds, ttlSeconds, timestamp)
 				}
 				for _, key := range keys {
-					service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, key, ds, timestamp), 0)
+					service.wheelManager.fireExpirationForTest(bucketId, key)
 				}
 
 				elapsed := time.Since(start)
@@ -326,7 +326,7 @@ func BenchmarkTTL_WheelSize(b *testing.B) {
 					service.RegisterKeyForActiveExpiration(bucketId, key, ds, ttlSeconds, timestamp)
 				}
 				for _, key := range keys {
-					service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, key, ds, timestamp), 0)
+					service.wheelManager.fireExpirationForTest(bucketId, key)
 				}
 
 				elapsed := time.Since(start)
@@ -410,7 +410,7 @@ func BenchmarkTTL_WheelConfigForDifferentTTLRanges(b *testing.B) {
 					service.RegisterKeyForActiveExpiration(bucketId, key, ds, sc.ttlSeconds, timestamp)
 				}
 				for _, key := range keys {
-					service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, key, ds, timestamp), 0)
+					service.wheelManager.fireExpirationForTest(bucketId, key)
 				}
 
 				elapsed := time.Since(start)

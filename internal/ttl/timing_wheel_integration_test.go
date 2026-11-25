@@ -16,6 +16,7 @@ package ttl
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -149,7 +150,7 @@ func TestTimingWheelIntegration_EndToEnd(t *testing.T) {
 	expireKeys := func(keys []string) {
 		for _, key := range keys {
 			meta := metaByKey[key]
-			service.wheelManager.onKeyExpired(newKeyMetadata(meta.bucketId, meta.key, meta.ds, meta.timestamp), 0)
+			service.wheelManager.fireExpirationForTest(meta.bucketId, meta.key)
 		}
 		collectEvents(t, eventsCh, len(keys))
 	}
@@ -225,8 +226,9 @@ func TestTimingWheelIntegration_KeyNotAccessibleAfterDeletion(t *testing.T) {
 	}
 
 	for _, key := range keys {
-		meta := newKeyMetadata(1, []byte(key), 1, timestamp)
-		service.wheelManager.onKeyExpired(meta, 0)
+		if !service.wheelManager.fireExpirationForTest(1, []byte(key)) {
+			t.Fatalf("key %s was not registered", key)
+		}
 	}
 
 	collectEvents(t, calls, len(keys))
@@ -317,10 +319,10 @@ func TestTimingWheelIntegration_LazyDeletionDedupesTimingWheel(t *testing.T) {
 
 	collectEvents(t, eventsCh, 1)
 
-	_, exists := service.wheelManager.keyCache.Load(hashKey(key))
-	assert.False(t, exists, "key should be deregistered after lazy deletion")
+	assert.Nil(t, service.wheelManager.lookupEntry(bucketId, key),
+		"key should be deregistered after lazy deletion")
 
-	service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, key, ds, timestamp), 0)
+	service.wheelManager.fireExpirationForTest(bucketId, key)
 	select {
 	case <-eventsCh:
 		t.Fatal("unexpected duplicate expiration event after deregistration")
@@ -362,7 +364,7 @@ func TestTimingWheelIntegration_ExpirationPipelineUnifiedProcessing(t *testing.T
 	valid := service.GetChecker().FilterExpiredRecord(bucketId, lazyKey, record, ds)
 	assert.False(t, valid)
 
-	service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, activeKey, ds, timestamp), 0)
+	service.wheelManager.fireExpirationForTest(bucketId, activeKey)
 
 	batch := waitForBatch(t, eventsCh)
 	require.Len(t, batch, 2)
@@ -418,7 +420,7 @@ func TestTimingWheelIntegration_MergeCleanupInteraction(t *testing.T) {
 	assert.Equal(t, "merge-live-2", string(merged[1].Key))
 
 	for _, record := range merged {
-		service.wheelManager.onKeyExpired(newKeyMetadata(bucketId, record.Key, ds, record.Timestamp), 0)
+		service.wheelManager.fireExpirationForTest(bucketId, record.Key)
 	}
 
 	collectEvents(t, eventsCh, len(merged))
@@ -506,7 +508,7 @@ func TestTimingWheelIntegration_ConcurrentOperations(t *testing.T) {
 	assert.Equal(t, expectedRemaining, metrics.RegisteredKeys, "half the keys should remain")
 
 	for _, meta := range metas {
-		service.wheelManager.onKeyExpired(newKeyMetadata(meta.bucketId, meta.key, meta.ds, meta.timestamp), 0)
+		service.wheelManager.fireExpirationForTest(meta.bucketId, meta.key)
 	}
 
 	collectEvents(t, calls, int(expectedRemaining))
@@ -527,6 +529,7 @@ func TestTimingWheelIntegration_HighLoad(t *testing.T) {
 	clock := NewMockClock(1000000)
 	const numKeys = 12000
 	const numBuckets = 100
+	// Single-lap TTLs so one fireExpirationForTest call expires each key.
 	const minTTL = 1
 	const maxTTL = 4
 	const numGoroutines = 20
@@ -548,7 +551,14 @@ func TestTimingWheelIntegration_HighLoad(t *testing.T) {
 		calls <- cloned
 	}
 
-	service := startTestService(t, clock, config, callback)
+	// Start only the queue processor. The wheel ticker is deliberately left
+	// stopped: the 1-4s TTLs would otherwise fire real timers while the test
+	// is still registering under the race detector, and the deterministic
+	// phase below drives expiration explicitly via fireExpirationForTest.
+	service := NewService(clock, config, callback)
+	require.NoError(t, service.lifecycle.Start(context.Background()))
+	service.lifecycle.Go(service.processExpirationEvents)
+	t.Cleanup(func() { _ = service.Stop(10 * time.Second) })
 	metas := make([]testKeyMeta, numKeys)
 	baseTimestamp := uint64(clock.NowMillis())
 
@@ -565,10 +575,12 @@ func TestTimingWheelIntegration_HighLoad(t *testing.T) {
 				bucketId := uint64(keyIndex % numBuckets)
 
 				key := make([]byte, 8)
-				key[0] = byte(keyIndex >> 24)
-				key[1] = byte(keyIndex >> 16)
-				key[2] = byte(keyIndex >> 8)
-				key[3] = byte(keyIndex)
+				// Encode the full keyIndex so every one of the numKeys
+				// registrations maps to a distinct (bucketId, key) pair;
+				// truncating the upper bytes used to collide across
+				// goroutines, which under one-item-per-key semantics would
+				// legitimately replace earlier registrations.
+				binary.BigEndian.PutUint32(key[0:4], uint32(keyIndex))
 				key[4] = byte(goroutineId)
 				key[5] = byte(i >> 8)
 				key[6] = byte(i)
@@ -601,7 +613,7 @@ func TestTimingWheelIntegration_HighLoad(t *testing.T) {
 	assert.Equal(t, int64(0), metrics.TriggeredDeletes, "no deletes should have occurred yet")
 
 	for _, meta := range metas {
-		service.wheelManager.onKeyExpired(newKeyMetadata(meta.bucketId, meta.key, meta.ds, meta.timestamp), 0)
+		service.wheelManager.fireExpirationForTest(meta.bucketId, meta.key)
 	}
 
 	collectEventsWithTimeout(t, calls, numKeys, 10*time.Second)

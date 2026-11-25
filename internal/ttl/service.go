@@ -45,7 +45,7 @@ func NewService(clk Clock, config Config, callback BatchExpiredCallback) *Servic
 
 	var wheelManager *TimingWheelManager
 	if config.EnableTimingWheel {
-		wheelManager = NewTimingWheelManager(config, queue)
+		wheelManager = NewTimingWheelManager(config, queue, clk)
 	}
 
 	service := &Service{
@@ -90,12 +90,16 @@ func (s *Service) GetChecker() *Checker {
 	return s.checker
 }
 
-// SetClock updates the service clock and propagates it to the checker.
-// Intended for tests that need deterministic time control.
+// SetClock updates the service clock and propagates it to the checker and
+// the timing wheel manager. Intended for tests that need deterministic time
+// control.
 func (s *Service) SetClock(clk Clock) {
 	s.clock = clk
 	if s.checker != nil {
 		s.checker.SetClock(clk)
+	}
+	if s.wheelManager != nil {
+		s.wheelManager.clock = clk
 	}
 }
 
@@ -186,6 +190,8 @@ func (s *Service) Name() string {
 
 // RegisterKeyForActiveExpiration registers a key in the timing wheel for active expiration.
 // Should be called when a key with TTL is written to the database.
+// Any previously registered item for the same key is cancelled first, so at
+// most the latest write version has an active timer.
 // If the timing wheel is disabled, this is a no-op.
 func (s *Service) RegisterKeyForActiveExpiration(
 	bucketId uint64,
@@ -200,10 +206,89 @@ func (s *Service) RegisterKeyForActiveExpiration(
 }
 
 // DeregisterKeyFromActiveExpiration removes a key from the timing wheel.
-// Should be called when a key is deleted before expiration or its TTL is updated.
+// Should be called when a key is deleted before expiration, made persistent,
+// or otherwise invalidated.
 // If the timing wheel is disabled, this is a no-op.
 func (s *Service) DeregisterKeyFromActiveExpiration(bucketId uint64, key []byte) {
 	if s.wheelManager != nil {
 		s.wheelManager.DeregisterKey(bucketId, key)
+	}
+}
+
+// SyncKeyExpiration reconciles the active expiration item of a key with the
+// outcome of a committed write:
+//   - ttl > 0 and the entry is not a delete marker: register a fresh item
+//     (cancelling any item left by a previous version of the key);
+//   - ttl == Persistent or a delete marker: remove any existing item so a
+//     stale timer cannot fire against the new state.
+//
+// If the timing wheel is disabled, this is a no-op.
+func (s *Service) SyncKeyExpiration(bucketId uint64, key []byte, ds uint16, ttl uint32, timestamp uint64, isDelete bool) {
+	if s.wheelManager == nil {
+		return
+	}
+	if ttl > 0 && !isDelete {
+		s.wheelManager.RegisterKey(bucketId, key, ds, ttl, timestamp)
+	} else {
+		s.wheelManager.DeregisterKey(bucketId, key)
+	}
+}
+
+// RebuildKeyExpiration re-registers a key while opening the database,
+// scheduling only the remaining lifetime instead of the full original TTL.
+// Items whose expiration instant is already in the past are dropped, and the
+// caller is responsible for cleaning their index entries.
+// Returns true when a timer was armed, false when the item was expired or
+// the wheel is disabled.
+func (s *Service) RebuildKeyExpiration(bucketId uint64, key []byte, ds uint16, ttl uint32, timestamp uint64) bool {
+	if s.wheelManager == nil || ttl == Persistent {
+		return false
+	}
+
+	expireAtMillis := int64(timestamp) + int64(ttl)*1000
+	remainingMillis := expireAtMillis - s.NowMillis()
+	if remainingMillis <= 0 {
+		// Already expired at rebuild time: clear any stale item and report
+		// that the record must be reaped rather than scheduled.
+		s.wheelManager.DeregisterKey(bucketId, key)
+		return false
+	}
+
+	// Ceiling to whole seconds; the wheel only schedules second-granularity
+	// TTLs anyway and firing one slot late is safe (expiration is rechecked
+	// against the live record before deletion).
+	remainingTTL := uint32((remainingMillis + 999) / 1000)
+	return s.wheelManager.RegisterKeyWithRemainingTTL(bucketId, key, ds, ttl, timestamp, remainingTTL)
+}
+
+// WheelEntryView is an immutable snapshot of a registered expiration item
+// exposed for white-box testing.
+type WheelEntryView struct {
+	Key       []byte
+	Ds        uint16
+	Timestamp uint64
+	Version   uint64
+	Lap       uint32
+}
+
+// GetTimingWheelManagerForTest exposes the wheel manager for white-box
+// testing. Production code must use the Register/Deregister facade methods.
+func (s *Service) GetTimingWheelManagerForTest() *TimingWheelManager {
+	return s.wheelManager
+}
+
+// LookupEntryForTest returns a snapshot of the key's registered item, or nil
+// when no active item exists. Test-only diagnostic.
+func (m *TimingWheelManager) LookupEntryForTest(bucketId uint64, key []byte) *WheelEntryView {
+	entry := m.lookupEntry(bucketId, key)
+	if entry == nil {
+		return nil
+	}
+	return &WheelEntryView{
+		Key:       entry.key,
+		Ds:        entry.ds,
+		Timestamp: entry.timestamp,
+		Version:   entry.version,
+		Lap:       entry.lap,
 	}
 }

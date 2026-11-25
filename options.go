@@ -139,6 +139,12 @@ type Options struct {
 	// If not set, DefaultTTLConfig() will be used.
 	TTLConfig TTLConfig
 
+	// clock is the time source used for every TTL decision, including the
+	// expiration checks performed while rebuilding indexes during Open. It
+	// defaults to a real clock; tests inject a MockClock here so reopen
+	// scenarios evaluate records on the same timeline as the writes.
+	clock ttl.Clock
+
 	// EnableHintFile represents if enable hint file feature.
 	// If EnableHintFile is true, hint files will be created and used for faster database startup.
 	// If EnableHintFile is false, hint files will not be created or used.

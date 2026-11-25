@@ -904,7 +904,11 @@ func (tx *Tx) getDeletedBuckets() (deletedBuckets map[core.BucketName]bool) {
 	return deletedBuckets
 }
 
-// registerKeysForActiveExpiration registers keys with TTL in the timing wheel for active expiration.
+// registerKeysForActiveExpiration reconciles the timing wheel with every
+// committed entry. A TTL write registers a fresh expiration item (replacing
+// any item from an older version of the same key); a delete marker or a
+// persistent (ttl == Persistent) write removes the item, so no stale timer
+// can outlive the value it was scheduled for.
 func (tx *Tx) registerKeysForActiveExpiration(records []*core.Record, entries []*core.Entry) {
 	if tx.db.ttlService == nil {
 		return
@@ -916,17 +920,26 @@ func (tx *Tx) registerKeysForActiveExpiration(records []*core.Record, entries []
 		if meta.TTL > 0 && meta.Flag != DataDeleteFlag {
 			record := records[i]
 
+			// Already expired at commit time: lazy expiration owns the
+			// cleanup, don't arm a timer that would fire immediately.
 			if tx.db.ttlService.IsExpired(record.TTL, record.Timestamp) {
+				tx.db.ttlService.DeregisterKeyFromActiveExpiration(meta.BucketId, entry.Key)
 				continue
 			}
 
-			tx.db.ttlService.RegisterKeyForActiveExpiration(
+			tx.db.ttlService.SyncKeyExpiration(
 				meta.BucketId,
 				entry.Key,
 				meta.Ds,
 				meta.TTL,
 				meta.Timestamp,
+				false,
 			)
+			continue
 		}
+
+		// Delete marker or persistent write: drop any expiration item that
+		// an earlier TTL version of this key may have left behind.
+		tx.db.ttlService.DeregisterKeyFromActiveExpiration(meta.BucketId, entry.Key)
 	}
 }

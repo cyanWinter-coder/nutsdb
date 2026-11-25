@@ -21,42 +21,34 @@ import (
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestKeyMetadataSize(t *testing.T) {
-	var meta keyMetadata
-	size := unsafe.Sizeof(meta)
-	t.Logf("keyMetadata size: %d bytes", size)
-	assert.LessOrEqual(t, size, uintptr(32), "keyMetadata size should be at most 32 bytes")
+func newTestManager(t *testing.T, clk Clock, config Config) (*TimingWheelManager, *expirationQueue) {
+	t.Helper()
+	if clk == nil {
+		clk = NewMockClock(1000000)
+	}
+	queue := newExpirationQueue(config.QueueSize)
+	mgr := NewTimingWheelManager(config, queue, clk)
+	return mgr, queue
 }
 
-func TestNewKeyMetadata(t *testing.T) {
-	bucketId := uint64(123)
-	key := []byte("test-key")
-	ds := uint16(1)
-	timestamp := uint64(1234567890)
-
-	meta := newKeyMetadata(bucketId, key, ds, timestamp)
-
-	assert.Equal(t, bucketId, meta.bucketId)
-	assert.Equal(t, ds, meta.ds)
-	assert.Equal(t, timestamp, meta.timestamp)
-	assert.NotZero(t, meta.keyHash)
+func enabledTestConfig() Config {
+	return Config{
+		EnableTimingWheel: true,
+		WheelSlotDuration: 100 * time.Millisecond,
+		WheelSize:         10,
+		QueueSize:         100,
+	}
 }
 
-func TestNewKeyReference(t *testing.T) {
-	bucketId := uint64(456)
-	key := []byte("another-key")
-	ds := uint16(2)
-	timestamp := uint64(9876543210)
-
-	ref := newKeyReference(bucketId, key, ds, timestamp)
-
-	assert.Equal(t, bucketId, ref.metadata.bucketId)
-	assert.Equal(t, ds, ref.metadata.ds)
-	assert.Equal(t, timestamp, ref.metadata.timestamp)
-	assert.NotZero(t, ref.metadata.keyHash)
-	assert.Equal(t, key, ref.key)
+func TestWheelEntrySize(t *testing.T) {
+	var entry wheelEntry
+	size := unsafe.Sizeof(entry)
+	t.Logf("wheelEntry size: %d bytes", size)
+	// Registry entry must stay compact: keyId-equivalent fields plus timer/lap.
+	assert.LessOrEqual(t, size, uintptr(96), "wheelEntry size should stay bounded")
 }
 
 func TestHashKey(t *testing.T) {
@@ -80,140 +72,74 @@ func TestHashKey(t *testing.T) {
 }
 
 func TestHashKeyUniqueness(t *testing.T) {
-	key1 := []byte("key1")
-	key2 := []byte("key2")
-
-	hash1 := hashKey(key1)
-	hash2 := hashKey(key2)
-
-	assert.NotEqual(t, hash1, hash2, "different keys should produce different hashes")
+	assert.NotEqual(t, hashKey([]byte("key1")), hashKey([]byte("key2")),
+		"different keys should produce different hashes")
 }
 
-func TestMakeRegistryKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		bucketId uint64
-		keyHash  uint64
-		expected string
-	}{
-		{"zero values", 0, 0, "0:0"},
-		{"small values", 1, 2, "1:2"},
-		{"large values", 18446744073709551615, 9223372036854775807, "18446744073709551615:9223372036854775807"},
-		{"mixed values", 123, 456789, "123:456789"},
-	}
+func TestTimingWheelManager_RegisterAndLookup(t *testing.T) {
+	clk := NewMockClock(1000000)
+	mgr, _ := newTestManager(t, clk, enabledTestConfig())
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := makeRegistryKey(tt.bucketId, tt.keyHash)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
+	bucketId := uint64(1)
+	key := []byte("test-key")
+	ts := uint64(clk.NowMillis())
 
-func TestAppendUint64(t *testing.T) {
-	tests := []struct {
-		name     string
-		n        uint64
-		expected string
-	}{
-		{"zero", 0, "0"},
-		{"one", 1, "1"},
-		{"small", 42, "42"},
-		{"large", 1234567890, "1234567890"},
-		{"max uint64", 18446744073709551615, "18446744073709551615"},
-	}
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf := make([]byte, 0, 32)
-			result := appendUint64(buf, tt.n)
-			assert.Equal(t, tt.expected, string(result))
-		})
-	}
-}
+	entry := mgr.lookupEntry(bucketId, key)
+	require.NotNil(t, entry)
+	assert.Equal(t, ts, entry.timestamp)
+	assert.Equal(t, key, entry.key)
+	assert.Equal(t, uint64(0), entry.version, "first registration starts at version 0")
+	assert.Equal(t, int64(1), mgr.GetMetrics().RegisteredKeys)
 
-func TestAppendUint64WithPrefix(t *testing.T) {
-	buf := []byte("prefix:")
-	result := appendUint64(buf, 123)
-	assert.Equal(t, "prefix:123", string(result))
+	// The registry must hold its own copy of the key.
+	key[0] = 'X'
+	entry = mgr.lookupEntry(bucketId, []byte("test-key"))
+	require.NotNil(t, entry)
+	assert.Equal(t, []byte("test-key"), entry.key, "registry must copy the key bytes")
 }
 
 func TestTimingWheelManager_DeregisterKey(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10,
-		QueueSize:         100,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
+	clk := NewMockClock(1000000)
+	mgr, _ := newTestManager(t, clk, enabledTestConfig())
 
 	bucketId := uint64(1)
 	key := []byte("test-key")
-	ds := uint16(1)
-	ttl := uint32(1)
-	timestamp := uint64(clock.NowMillis())
+	ts := uint64(clk.NowMillis())
 
-	registered := mgr.RegisterKey(bucketId, key, ds, ttl, timestamp)
-	assert.True(t, registered, "key should be registered")
-	assert.Equal(t, int64(1), mgr.registeredKeys.Load(), "registered keys count should be 1")
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
+	require.NotNil(t, mgr.lookupEntry(bucketId, key))
 
-	keyHash := hashKey(key)
-	_, exists := mgr.keyCache.Load(keyHash)
-	assert.True(t, exists, "key should be in cache")
+	assert.True(t, mgr.DeregisterKey(bucketId, key))
+	assert.Nil(t, mgr.lookupEntry(bucketId, key))
+	assert.Equal(t, int64(0), mgr.GetMetrics().RegisteredKeys)
 
-	deregistered := mgr.DeregisterKey(bucketId, key)
-	assert.True(t, deregistered, "key should be deregistered")
-	assert.Equal(t, int64(0), mgr.registeredKeys.Load(), "registered keys count should be 0")
-
-	_, exists = mgr.keyCache.Load(keyHash)
-	assert.False(t, exists, "key should be removed from cache")
-
-	deregistered = mgr.DeregisterKey(bucketId, key)
-	assert.False(t, deregistered, "deregistering non-existent key should return false")
+	// Idempotent: deregistering an unknown key returns false and does not panic.
+	assert.False(t, mgr.DeregisterKey(bucketId, key))
 }
 
 func TestTimingWheelManager_DeregisterKey_WhenDisabled(t *testing.T) {
-	config := Config{
-		EnableTimingWheel: false,
-		QueueSize:         100,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
+	config := Config{EnableTimingWheel: false, QueueSize: 100}
+	mgr, _ := newTestManager(t, NewMockClock(1000000), config)
 
-	bucketId := uint64(1)
-	key := []byte("test-key")
-
-	deregistered := mgr.DeregisterKey(bucketId, key)
-	assert.False(t, deregistered, "deregister should return false when wheel is disabled")
+	assert.False(t, mgr.DeregisterKey(1, []byte("test-key")))
+	assert.False(t, mgr.RegisterKey(1, []byte("test-key"), 1, 1, 1))
 }
 
+// TestTimingWheelManager_DeregisterKey_PreventsExpiration verifies that after
+// deregistration, even a fired timer cannot produce an expiration event.
 func TestTimingWheelManager_DeregisterKey_PreventsExpiration(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10,
-		QueueSize:         100,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
+	clk := NewMockClock(1000000)
+	mgr, queue := newTestManager(t, clk, enabledTestConfig())
 
 	bucketId := uint64(1)
 	key := []byte("test-key")
-	ds := uint16(1)
-	ttl := uint32(1) // 1 second
-	timestamp := uint64(clock.NowMillis())
+	ts := uint64(clk.NowMillis())
 
-	registered := mgr.RegisterKey(bucketId, key, ds, ttl, timestamp)
-	assert.True(t, registered, "key should be registered")
-
-	deregistered := mgr.DeregisterKey(bucketId, key)
-	assert.True(t, deregistered, "key should be deregistered")
-
-	metadata := newKeyMetadata(bucketId, key, ds, timestamp)
-	mgr.onKeyExpired(metadata, 0)
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
+	require.True(t, mgr.DeregisterKey(bucketId, key))
+	assert.False(t, mgr.fireExpirationForTest(bucketId, key))
 
 	select {
 	case event := <-queue.events:
@@ -222,272 +148,335 @@ func TestTimingWheelManager_DeregisterKey_PreventsExpiration(t *testing.T) {
 	}
 }
 
-func TestTimingWheelManager_OnKeyExpired_SuccessfulPush(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10,
-		QueueSize:         100,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
+// TestTimingWheelManager_OnKeyExpired_EmitsEvent covers the normal expiration
+// path: one event with the registration timestamp, entry removed afterwards.
+func TestTimingWheelManager_OnKeyExpired_EmitsEvent(t *testing.T) {
+	clk := NewMockClock(1000000)
+	mgr, queue := newTestManager(t, clk, enabledTestConfig())
 
 	bucketId := uint64(1)
 	key := []byte("test-key")
 	ds := uint16(1)
-	ttl := uint32(1) // 1 second
-	timestamp := uint64(clock.NowMillis())
+	ts := uint64(clk.NowMillis())
 
-	registered := mgr.RegisterKey(bucketId, key, ds, ttl, timestamp)
-	assert.True(t, registered, "key should be registered")
-	assert.Equal(t, int64(1), mgr.registeredKeys.Load())
-
-	metadata := newKeyMetadata(bucketId, key, ds, timestamp)
-	mgr.onKeyExpired(metadata, 0)
+	require.True(t, mgr.RegisterKey(bucketId, key, ds, 1, ts))
+	require.True(t, mgr.fireExpirationForTest(bucketId, key))
 
 	select {
 	case event := <-queue.events:
 		assert.Equal(t, bucketId, event.BucketId)
 		assert.Equal(t, key, event.Key)
 		assert.Equal(t, ds, event.Ds)
-		assert.Equal(t, timestamp, event.Timestamp)
+		assert.Equal(t, ts, event.Timestamp)
 	default:
 		t.Fatal("expected expiration event but none received")
 	}
 
-	assert.Equal(t, int64(1), mgr.triggeredDeletes.Load())
-	assert.Equal(t, int64(0), mgr.failedPushes.Load())
-	assert.Equal(t, int64(0), mgr.registeredKeys.Load())
-
-	keyHash := hashKey(key)
-	_, exists := mgr.keyCache.Load(keyHash)
-	assert.False(t, exists, "key should be removed from cache after expiration")
+	assert.Equal(t, int64(1), mgr.GetMetrics().TriggeredDeletes)
+	assert.Nil(t, mgr.lookupEntry(bucketId, key), "entry must be removed after expiration")
+	assert.Equal(t, int64(0), mgr.GetMetrics().RegisteredKeys)
 }
 
+// TestTimingWheelManager_OnKeyExpired_QueueFull verifies the retry buffer
+// still receives the event when the main queue is full.
 func TestTimingWheelManager_OnKeyExpired_QueueFull(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10,
-		QueueSize:         2, // Small queue to test full condition
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
+	clk := NewMockClock(1000000)
+	config := enabledTestConfig()
+	config.QueueSize = 2
+	mgr, queue := newTestManager(t, clk, config)
 
 	for i := 0; i < config.QueueSize; i++ {
 		queue.push(&ExpirationEvent{
 			BucketId:  uint64(i),
 			Key:       []byte("filler"),
 			Ds:        1,
-			Timestamp: uint64(clock.NowMillis()),
+			Timestamp: uint64(clk.NowMillis()),
 		})
 	}
 
 	bucketId := uint64(100)
 	key := []byte("test-key")
-	ds := uint16(1)
-	ttl := uint32(1) // 1 second
-	timestamp := uint64(clock.NowMillis())
+	ts := uint64(clk.NowMillis())
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
+	require.True(t, mgr.fireExpirationForTest(bucketId, key))
 
-	registered := mgr.RegisterKey(bucketId, key, ds, ttl, timestamp)
-	assert.True(t, registered, "key should be registered")
-
-	metadata := newKeyMetadata(bucketId, key, ds, timestamp)
-	mgr.onKeyExpired(metadata, 0)
-
-	failedPushes := mgr.failedPushes.Load()
-	assert.Equal(t, int64(1), failedPushes, "failed pushes should be 1")
-
+	assert.Equal(t, int64(1), mgr.GetMetrics().FailedPushes)
 	select {
 	case event := <-mgr.retryBuffer:
 		assert.Equal(t, bucketId, event.BucketId)
 		assert.Equal(t, key, event.Key)
-		assert.Equal(t, ds, event.Ds)
-		assert.Equal(t, timestamp, event.Timestamp)
+		assert.Equal(t, ts, event.Timestamp)
 	default:
-		t.Fatalf("expected event in retry buffer but none found. Failed pushes: %d, Retry buffer len: %d",
-			failedPushes, len(mgr.retryBuffer))
+		t.Fatal("expected event in retry buffer but none found")
 	}
 }
 
+// TestTimingWheelManager_OnKeyExpired_MultiLap verifies long TTLs reschedule
+// for each wheel rotation and only emit after the final lap.
 func TestTimingWheelManager_OnKeyExpired_MultiLap(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10, // Total coverage: 1 second
-		QueueSize:         100,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
-	defer mgr.registry.clear()
+	clk := NewMockClock(1000000)
+	config := enabledTestConfig()
+	// Wheel coverage = 100ms * 10 = 1s; ttl=3s spans multiple rotations.
+	config.WheelSize = 10
+	mgr, queue := newTestManager(t, clk, config)
+	defer mgr.Stop(time.Second)
 
 	bucketId := uint64(1)
 	key := []byte("test-key")
-	ds := uint16(1)
-	ttl := uint32(3) // 3 seconds, exceeds wheel coverage
-	timestamp := uint64(clock.NowMillis())
+	ts := uint64(clk.NowMillis())
 
-	registered := mgr.RegisterKey(bucketId, key, ds, ttl, timestamp)
-	assert.True(t, registered, "key should be registered")
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 3, ts))
 
-	metadata := newKeyMetadata(bucketId, key, ds, timestamp)
-	mgr.onKeyExpired(metadata, 1)
+	entry := mgr.lookupEntry(bucketId, key)
+	require.NotNil(t, entry)
+	require.Positive(t, entry.lap, "ttl beyond wheel coverage must use laps")
+	laps := entry.lap
+	version := entry.version
 
-	select {
-	case event := <-queue.events:
-		t.Errorf("unexpected early expiration event: %+v", event)
-	default:
+	// Fire the intermediate rotations: no events, lap count decreasing.
+	for lap := laps; lap > 0; lap-- {
+		require.True(t, mgr.fireExpirationForTest(bucketId, key))
+		select {
+		case event := <-queue.events:
+			t.Errorf("unexpected early expiration event: %+v", event)
+		default:
+		}
+		entry = mgr.lookupEntry(bucketId, key)
+		require.NotNil(t, entry, "entry must survive intermediate laps")
+		assert.Equal(t, lap-1, entry.lap)
+		assert.Equal(t, version, entry.version, "laps must not change the version")
 	}
 
-	mgr.onKeyExpired(metadata, 0)
+	// Final lap emits the event.
+	require.True(t, mgr.fireExpirationForTest(bucketId, key))
 	select {
 	case event := <-queue.events:
-		assert.Equal(t, bucketId, event.BucketId)
-		assert.Equal(t, key, event.Key)
-		assert.Equal(t, ds, event.Ds)
+		assert.Equal(t, ts, event.Timestamp)
+	default:
+		t.Fatal("expected expiration event after full TTL but none found")
+	}
+}
+
+// TestTimingWheelManager_OnKeyExpired_UnknownKeySkipped fires a callback for a
+// keyId that has no registry entry (e.g. an already-deregistered timer).
+func TestTimingWheelManager_OnKeyExpired_UnknownKeySkipped(t *testing.T) {
+	clk := NewMockClock(1000000)
+	mgr, queue := newTestManager(t, clk, enabledTestConfig())
+
+	id := keyId{bucketId: 1, keyHash: hashKey([]byte("ghost"))}
+	mgr.onKeyExpired(id, 0)
+
+	select {
+	case event := <-queue.events:
+		t.Errorf("unexpected expiration event for unknown key: %+v", event)
+	default:
+	}
+	assert.Equal(t, int64(0), mgr.GetMetrics().TriggeredDeletes)
+}
+
+// TestTimingWheelManager_OverwriteCancelsOldVersion is the core regression for
+// "short TTL then long TTL": the stale timer must never delete the new value.
+func TestTimingWheelManager_OverwriteCancelsOldVersion(t *testing.T) {
+	clk := NewMockClock(1000000)
+	// Wheel coverage = 50ms * 20 = 1s, so both TTLs fit in a single lap.
+	config := Config{
+		EnableTimingWheel: true,
+		WheelSlotDuration: 50 * time.Millisecond,
+		WheelSize:         20,
+		QueueSize:         100,
+	}
+	mgr, queue := newTestManager(t, clk, config)
+
+	bucketId := uint64(1)
+	key := []byte("k")
+	ds := uint16(1)
+	ts1 := uint64(clk.NowMillis())
+
+	// Version 1: short TTL.
+	require.True(t, mgr.RegisterKey(bucketId, key, ds, 1, ts1))
+	entryV1 := mgr.lookupEntry(bucketId, key)
+	require.NotNil(t, entryV1)
+	require.Equal(t, uint64(0), entryV1.version)
+
+	// Version 2: long TTL, one millisecond later. The version counter, not
+	// the timestamp, must tell the timers apart.
+	clk.AdvanceTime(time.Millisecond)
+	ts2 := uint64(clk.NowMillis())
+	require.True(t, mgr.RegisterKey(bucketId, key, ds, 1, ts2))
+	entryV2 := mgr.lookupEntry(bucketId, key)
+	require.NotNil(t, entryV2)
+	assert.Equal(t, uint64(1), entryV2.version)
+	assert.Equal(t, int64(1), mgr.GetMetrics().RegisteredKeys,
+		"overwrite must keep exactly one item per key")
+
+	// The v1 timer fires after its short TTL. Its captured version (0) no
+	// longer matches, so it must be a no-op: no event, v2 entry untouched.
+	mgr.onKeyExpired(keyId{bucketId: bucketId, keyHash: hashKey(key)}, entryV1.version)
+	select {
+	case event := <-queue.events:
+		t.Errorf("stale timer deleted the overwritten value: %+v", event)
+	default:
+	}
+	entry := mgr.lookupEntry(bucketId, key)
+	require.NotNil(t, entry, "new version must survive the old timer firing")
+	assert.Equal(t, entryV2.version, entry.version)
+	assert.Equal(t, ts2, entry.timestamp)
+
+	// The current version still expires normally at its own deadline.
+	require.True(t, mgr.fireExpirationForTest(bucketId, key))
+	select {
+	case event := <-queue.events:
+		assert.Equal(t, ts2, event.Timestamp)
+	default:
+		t.Fatal("expected the current version to expire at its own deadline")
+	}
+}
+
+// TestTimingWheelManager_OverwriteSameTimestamp still distinguishes versions
+// when both writes land in the same millisecond.
+func TestTimingWheelManager_OverwriteSameTimestamp(t *testing.T) {
+	clk := NewMockClock(1000000)
+	mgr, queue := newTestManager(t, clk, enabledTestConfig())
+
+	bucketId := uint64(1)
+	key := []byte("k")
+	ts := uint64(clk.NowMillis())
+
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
+	v1 := mgr.lookupEntry(bucketId, key)
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 100, ts))
+
+	// Stale v1 timer with the identical timestamp: version mismatch saves it.
+	mgr.onKeyExpired(keyId{bucketId: bucketId, keyHash: hashKey(key)}, v1.version)
+	select {
+	case event := <-queue.events:
+		t.Errorf("stale timer fired despite identical timestamp: %+v", event)
+	default:
+	}
+	require.NotNil(t, mgr.lookupEntry(bucketId, key))
+}
+
+// TestTimingWheelManager_RegisterThenDeregisterThenReregister verifies the
+// version counter keeps moving forward across the full key lifecycle.
+func TestTimingWheelManager_RegisterThenDeregisterThenReregister(t *testing.T) {
+	clk := NewMockClock(1000000)
+	mgr, _ := newTestManager(t, clk, enabledTestConfig())
+
+	bucketId := uint64(1)
+	key := []byte("k")
+	ts := uint64(clk.NowMillis())
+
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
+	first := mgr.lookupEntry(bucketId, key)
+	require.True(t, mgr.DeregisterKey(bucketId, key))
+	require.True(t, mgr.RegisterKey(bucketId, key, 1, 1, ts))
+	second := mgr.lookupEntry(bucketId, key)
+
+	require.NotNil(t, first)
+	require.NotNil(t, second)
+	assert.Greater(t, second.version, first.version,
+		"versions must never be reused even after deregistration")
+}
+
+// TestTimingWheelManager_RebuildWithRemainingTTL verifies restart semantics:
+// only the remaining lifetime is scheduled and already-expired items are
+// cleaned instead of armed.
+func TestTimingWheelManager_RebuildWithRemainingTTL(t *testing.T) {
+	clk := NewMockClock(1000000)
+	mgr, queue := newTestManager(t, clk, enabledTestConfig())
+
+	bucketId := uint64(1)
+	key := []byte("rebuild-key")
+
+	// Record written 300ms ago with ttl=1s: 700ms remain, fitting in one
+	// wheel rotation (coverage = 100ms * 10 = 1s).
+	originalTTL := uint32(1)
+	timestamp := uint64(clk.NowMillis() - 300)
+
+	remaining := uint32((int64(timestamp) + int64(originalTTL)*1000 - clk.NowMillis() + 999) / 1000)
+	assert.Equal(t, uint32(1), remaining)
+
+	require.True(t, mgr.RegisterKeyWithRemainingTTL(bucketId, key, 1, originalTTL, timestamp, remaining))
+	entry := mgr.lookupEntry(bucketId, key)
+	require.NotNil(t, entry)
+	assert.Equal(t, timestamp, entry.timestamp, "event must carry the original timestamp")
+
+	// Already expired: no timer armed, any stale entry removed.
+	expiredKey := []byte("expired-key")
+	require.True(t, mgr.RegisterKey(bucketId, expiredKey, 1, 1, uint64(clk.NowMillis())))
+	assert.False(t, mgr.RegisterKeyWithRemainingTTL(bucketId, expiredKey, 1, 1,
+		uint64(clk.NowMillis()-5000), 0))
+	assert.Nil(t, mgr.lookupEntry(bucketId, expiredKey),
+		"expired rebuild item must be cleaned immediately")
+
+	// The live key still fires exactly one event with the original timestamp.
+	require.True(t, mgr.fireExpirationForTest(bucketId, key))
+	select {
+	case event := <-queue.events:
 		assert.Equal(t, timestamp, event.Timestamp)
 	default:
-		t.Fatal("expected expiration event after full TTL but none received")
+		t.Fatal("expected rebuilt key to expire")
 	}
 }
 
-func TestTimingWheelManager_OnKeyExpired_DeletedKeySkipped(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10,
-		QueueSize:         100,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
-
-	bucketId := uint64(1)
-	key := []byte("test-key")
-	ds := uint16(1)
-	timestamp := uint64(clock.NowMillis())
-
-	metadata := newKeyMetadata(bucketId, key, ds, timestamp)
-
-	mgr.onKeyExpired(metadata, 0)
-
-	select {
-	case event := <-queue.events:
-		t.Errorf("unexpected expiration event for non-existent key: %+v", event)
-	default:
-	}
-
-	assert.Equal(t, int64(0), mgr.triggeredDeletes.Load())
-	assert.Equal(t, int64(0), mgr.failedPushes.Load())
-}
-
-// TestTimingWheelManager_Lifecycle tests the Start and Stop methods.
+// TestTimingWheelManager_Lifecycle covers start/stop including timer cleanup.
 func TestTimingWheelManager_Lifecycle(t *testing.T) {
 	t.Run("start and stop enabled wheel", func(t *testing.T) {
-		config := Config{
-			EnableTimingWheel: true,
-			WheelSlotDuration: 100 * time.Millisecond,
-			WheelSize:         10,
-			QueueSize:         10,
-		}
-		queue := newExpirationQueue(config.QueueSize)
-		mgr := NewTimingWheelManager(config, queue)
+		mgr, _ := newTestManager(t, NewMockClock(1000000), enabledTestConfig())
 
-		ctx := context.Background()
-		err := mgr.Start(ctx)
-		assert.NoError(t, err)
-
+		require.NoError(t, mgr.Start(context.Background()))
 		assert.True(t, mgr.lifecycle.IsRunning())
-
-		err = mgr.Stop(1 * time.Second)
-		assert.NoError(t, err)
-
+		require.NoError(t, mgr.Stop(1*time.Second))
 		assert.True(t, mgr.lifecycle.IsStopped())
 	})
 
+	t.Run("stop cancels pending timers and clears entries", func(t *testing.T) {
+		mgr, _ := newTestManager(t, NewMockClock(1000000), enabledTestConfig())
+		require.NoError(t, mgr.Start(context.Background()))
+
+		require.True(t, mgr.RegisterKey(1, []byte("a"), 1, 100, 1))
+		require.True(t, mgr.RegisterKey(1, []byte("b"), 1, 100, 1))
+
+		require.NoError(t, mgr.Stop(1*time.Second))
+		assert.Nil(t, mgr.lookupEntry(1, []byte("a")))
+		assert.Nil(t, mgr.lookupEntry(1, []byte("b")))
+		assert.Equal(t, int64(0), mgr.GetMetrics().RegisteredKeys)
+	})
+
 	t.Run("start and stop disabled wheel", func(t *testing.T) {
-		config := Config{
-			EnableTimingWheel: false,
-			QueueSize:         10,
-		}
-		queue := newExpirationQueue(config.QueueSize)
-		mgr := NewTimingWheelManager(config, queue)
+		config := Config{EnableTimingWheel: false, QueueSize: 10}
+		mgr, _ := newTestManager(t, NewMockClock(1000000), config)
 
-		ctx := context.Background()
-		err := mgr.Start(ctx)
-		assert.NoError(t, err)
-
-		err = mgr.Stop(1 * time.Second)
-		assert.NoError(t, err)
+		require.NoError(t, mgr.Start(context.Background()))
+		require.NoError(t, mgr.Stop(1*time.Second))
 	})
 
 	t.Run("stop is idempotent", func(t *testing.T) {
-		config := Config{
-			EnableTimingWheel: true,
-			WheelSlotDuration: 100 * time.Millisecond,
-			WheelSize:         10,
-			QueueSize:         10,
-		}
-		queue := newExpirationQueue(config.QueueSize)
-		mgr := NewTimingWheelManager(config, queue)
-
-		ctx := context.Background()
-		err := mgr.Start(ctx)
-		assert.NoError(t, err)
-
-		err = mgr.Stop(1 * time.Second)
-		assert.NoError(t, err)
-
-		err = mgr.Stop(1 * time.Second)
-		assert.NoError(t, err)
+		mgr, _ := newTestManager(t, NewMockClock(1000000), enabledTestConfig())
+		require.NoError(t, mgr.Start(context.Background()))
+		require.NoError(t, mgr.Stop(1*time.Second))
+		require.NoError(t, mgr.Stop(1*time.Second))
 	})
 
 	t.Run("name returns correct value", func(t *testing.T) {
-		config := Config{
-			EnableTimingWheel: true,
-			WheelSlotDuration: 100 * time.Millisecond,
-			WheelSize:         10,
-			QueueSize:         10,
-		}
-		queue := newExpirationQueue(config.QueueSize)
-		mgr := NewTimingWheelManager(config, queue)
-
+		mgr, _ := newTestManager(t, NewMockClock(1000000), enabledTestConfig())
 		assert.Equal(t, "TimingWheelManager", mgr.Name())
 	})
 }
 
-// TestTimingWheelManager_GetMetrics tests the GetMetrics method.
 func TestTimingWheelManager_GetMetrics(t *testing.T) {
-	clock := NewMockClock(1000000)
-	config := Config{
-		EnableTimingWheel: true,
-		WheelSlotDuration: 100 * time.Millisecond,
-		WheelSize:         10,
-		QueueSize:         10,
-	}
-	queue := newExpirationQueue(config.QueueSize)
-	mgr := NewTimingWheelManager(config, queue)
+	clk := NewMockClock(1000000)
+	mgr, _ := newTestManager(t, clk, enabledTestConfig())
 
-	ctx := context.Background()
-	err := mgr.Start(ctx)
-	assert.NoError(t, err)
+	require.NoError(t, mgr.Start(context.Background()))
 	defer mgr.Stop(1 * time.Second)
 
 	metrics := mgr.GetMetrics()
 	assert.Equal(t, int64(0), metrics.RegisteredKeys)
-	assert.Equal(t, int64(0), metrics.TriggeredDeletes)
-	assert.Equal(t, int64(0), metrics.FailedPushes)
 
-	mgr.RegisterKey(1, []byte("key1"), 1, 1, uint64(clock.NowSeconds()))
+	require.True(t, mgr.RegisterKey(1, []byte("key1"), 1, 1, uint64(clk.NowMillis())))
+	assert.Equal(t, int64(1), mgr.GetMetrics().RegisteredKeys)
 
-	metrics = mgr.GetMetrics()
-	assert.Equal(t, int64(1), metrics.RegisteredKeys)
-
-	mgr.DeregisterKey(1, []byte("key1"))
-
-	metrics = mgr.GetMetrics()
-	assert.Equal(t, int64(0), metrics.RegisteredKeys)
+	require.True(t, mgr.DeregisterKey(1, []byte("key1")))
+	assert.Equal(t, int64(0), mgr.GetMetrics().RegisteredKeys)
 }

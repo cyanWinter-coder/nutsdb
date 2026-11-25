@@ -109,7 +109,11 @@ func open(opt Options) (*DB, error) {
 		snowflakeMgr:            NewSnowflakeManager(opt.NodeNum),
 	}
 
-	db.ttlService = ttl.NewService(ttl.NewRealClock(), opt.TTLConfig, db.handleExpiredKeys)
+	clk := opt.clock
+	if clk == nil {
+		clk = ttl.NewRealClock()
+	}
+	db.ttlService = ttl.NewService(clk, opt.TTLConfig, db.handleExpiredKeys)
 
 	db.Index = db.newIndex()
 
@@ -849,7 +853,14 @@ func (db *DB) buildIdxes(record *core.Record, entry *core.Entry) error {
 	return nil
 }
 
-// registerKeyForActiveExpiration registers a key with TTL in the timing wheel for active expiration.
+// registerKeyForActiveExpiration rebuilds the active expiration item for a
+// key while opening the database. The timer is armed with the remaining TTL
+// (absolute expiration instant timestamp+ttl is preserved), so restarting
+// the database never extends a key's lifetime.
+//
+// Items already expired at rebuild time are not registered; their index
+// entries are dropped by the build*Idx callers and lazy expiration reaps any
+// record the index still holds.
 func (db *DB) registerKeyForActiveExpiration(record *core.Record, entry *core.Entry) {
 	if db.ttlService == nil {
 		return
@@ -859,20 +870,24 @@ func (db *DB) registerKeyForActiveExpiration(record *core.Record, entry *core.En
 
 	if meta.TTL > 0 && meta.Flag != DataDeleteFlag {
 		if db.ttlService.IsExpired(record.TTL, record.Timestamp) {
+			// Already expired on disk: no timer to arm; make sure no earlier
+			// rebuild step left an item behind for this key.
+			db.ttlService.DeregisterKeyFromActiveExpiration(meta.BucketId, entry.Key)
 			return
 		}
 
-		// Deregister old TTL before registering new one (handles TTL updates)
-		db.ttlService.DeregisterKeyFromActiveExpiration(meta.BucketId, entry.Key)
-
-		db.ttlService.RegisterKeyForActiveExpiration(
+		db.ttlService.RebuildKeyExpiration(
 			meta.BucketId,
 			entry.Key,
 			meta.Ds,
 			meta.TTL,
 			meta.Timestamp,
 		)
+		return
 	}
+
+	// Delete marker or persistent record: nothing may remain registered.
+	db.ttlService.DeregisterKeyFromActiveExpiration(meta.BucketId, entry.Key)
 }
 
 // buildSetIdx builds set index when opening the DB.
@@ -1108,7 +1123,12 @@ func (db *DB) IsClose() bool {
 // 3. Re-inserted with new TTL (timestamp T2)
 // 4. Async deletion from step 2 executes and mistakenly deletes the new key
 //
-// By comparing timestamps, we ensure only the originally expired key is deleted.
+// Defense in depth: the timing wheel already drops timers whose captured
+// version no longer matches the registered entry, so a stale event should
+// never arrive. This timestamp comparison is the independent second guard
+// for events coming from the lazy-expiration path, and it also covers the
+// case where two writes share the same millisecond timestamp: only the
+// record that is genuinely expired is ever deleted.
 func (db *DB) handleExpiredKeys(events []*ttl.ExpirationEvent) {
 	if len(events) == 0 {
 		return

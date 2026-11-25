@@ -15,6 +15,7 @@
 package ttl
 
 import (
+	"sync"
 	"sync/atomic"
 )
 
@@ -27,10 +28,14 @@ type ExpirationEvent struct {
 }
 
 // expirationQueue manages a queue of expiration events.
-// Deduplication is removed since the delete callback should be idempotent.
+// Deduplication is handled one layer up by the TimingWheelManager (one item
+// per key with a version guard); this queue only needs to deliver events
+// safely. mu serializes push against close so a timer goroutine can never
+// send on a channel that is concurrently being closed.
 type expirationQueue struct {
 	events chan *ExpirationEvent
 	closed atomic.Bool
+	mu     sync.Mutex
 }
 
 // newExpirationQueue creates a new expiration queue with the specified buffer size.
@@ -47,6 +52,14 @@ func (eq *expirationQueue) push(event *ExpirationEvent) bool {
 		return false
 	}
 
+	eq.mu.Lock()
+	defer eq.mu.Unlock()
+
+	// Re-check under the lock: close() may have run after the fast-path load.
+	if eq.closed.Load() {
+		return false
+	}
+
 	select {
 	case eq.events <- event:
 		return true
@@ -58,6 +71,8 @@ func (eq *expirationQueue) push(event *ExpirationEvent) bool {
 // close closes the expiration queue.
 func (eq *expirationQueue) close() {
 	if eq.closed.CompareAndSwap(false, true) {
+		eq.mu.Lock()
+		defer eq.mu.Unlock()
 		close(eq.events)
 	}
 }
