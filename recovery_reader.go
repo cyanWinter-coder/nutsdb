@@ -2,6 +2,8 @@ package nutsdb
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 
@@ -36,61 +38,73 @@ func newFileRecovery(path string, bufSize int) (fr *fileRecovery, err error) {
 
 // readEntry will read an Entry from disk.
 func (fr *fileRecovery) readEntry(off int64) (e *core.Entry, err error) {
-	var size int64 = core.MaxEntryHeaderSize
-	// Since core.MaxEntryHeaderSize may be larger than the actual Header, it needs to be calculated
-	if off+size > fr.size {
-		size = fr.size - off
+	e, _, err = fr.readEntryWithOffset(off)
+	return e, err
+}
+
+// readEntryWithOffset reads the entry at off and returns the offset immediately
+// after it. A non-nil entry may be returned together with ErrCrc so callers can
+// inspect the declared record boundaries.
+func (fr *fileRecovery) readEntryWithOffset(off int64) (e *core.Entry, nextOff int64, err error) {
+	if off < 0 || off > fr.size {
+		return nil, off, io.EOF
 	}
 
-	buf := make([]byte, size)
-	_, err = fr.fd.Seek(off, 0)
-	if err != nil {
-		return nil, err
+	headerBuf := make([]byte, core.MaxEntryHeaderSize)
+	n, readErr := fr.fd.ReadAt(headerBuf, off)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return nil, off, readErr
 	}
 
-	_, err = fr.fd.Read(buf)
-	if err != nil {
-		return nil, err
+	if n < core.MinEntryHeaderSize {
+		if n == 0 && errors.Is(readErr, io.EOF) {
+			return nil, off, io.EOF
+		}
+		return nil, off, core.ErrHeaderSizeOutOfBounds
 	}
 
 	e = new(core.Entry)
-	headerSize, err := e.ParseMeta(buf)
+	headerSize, err := e.ParseMeta(headerBuf[:n])
 	if err != nil {
-		return nil, err
+		return nil, off, err
 	}
 
 	if e.IsZero() {
-		return nil, nil
+		return nil, off, nil
 	}
-
-	headerBuf := buf[:headerSize]
-	remainingBuf := buf[headerSize:]
 
 	payloadSize := e.Meta.PayloadSize()
+	if payloadSize < 0 || headerSize < 0 || off > fr.size-headerSize {
+		return nil, off, fmt.Errorf("%w: invalid record length at offset %d", io.ErrUnexpectedEOF, off)
+	}
+
+	headerEnd := off + headerSize
+	if payloadSize > fr.size-headerEnd {
+		return e, off + headerSize + payloadSize, fmt.Errorf(
+			"%w: record at offset %d needs %d payload bytes, file size is %d",
+			io.ErrUnexpectedEOF, off, payloadSize, fr.size,
+		)
+	}
+
 	dataBuf := make([]byte, payloadSize)
-	excessSize := size - headerSize
-
-	if payloadSize <= excessSize {
-		copy(dataBuf, remainingBuf[:payloadSize])
-	} else {
-		copy(dataBuf, remainingBuf)
-		_, err := fr.fd.Read(dataBuf[excessSize:])
-		if err != nil {
-			return nil, err
+	if _, err = fr.fd.ReadAt(dataBuf, headerEnd); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
 		}
+		return e, off + headerSize + payloadSize, err
 	}
 
-	err = e.ParsePayload(dataBuf)
-	if err != nil {
-		return nil, err
+	if err = e.ParsePayload(dataBuf); err != nil {
+		return e, off + headerSize + payloadSize, err
 	}
 
+	headerBuf = headerBuf[:headerSize]
 	crc := e.GetCrc(headerBuf)
 	if crc != e.Meta.Crc {
-		return nil, ErrCrc
+		return e, off + headerSize + payloadSize, ErrCrc
 	}
 
-	return e, nil
+	return e, off + headerSize + payloadSize, nil
 }
 
 func (fr *fileRecovery) readBucket() (b *core.Bucket, err error) {

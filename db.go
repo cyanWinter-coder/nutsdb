@@ -318,6 +318,30 @@ func (db *DB) release() error {
 	return nil
 }
 
+// rotateActiveFile seals the active data file and makes a new, empty data
+// file the active one. The caller must hold db.mu.
+func (db *DB) rotateActiveFile() error {
+	db.MaxFileID++
+
+	if !db.opt.SyncEnable && db.opt.RWMode == MMap {
+		if err := db.ActiveFile.rwManager.Sync(); err != nil {
+			return err
+		}
+	}
+
+	if err := db.ActiveFile.rwManager.Release(); err != nil {
+		return err
+	}
+
+	activeFile, err := db.fm.GetDataFile(getDataPath(db.MaxFileID, db.opt.Dir), db.opt.SegmentSize)
+	if err != nil {
+		return err
+	}
+	db.ActiveFile = activeFile
+	db.ActiveFile.fileID = db.MaxFileID
+	return nil
+}
+
 func (db *DB) getValueByRecord(record *core.Record) ([]byte, error) {
 	if record == nil {
 		return nil, ErrRecordIsNil
@@ -540,12 +564,94 @@ func (db *DB) getMaxFileIDAndFileIDs() (maxFileID int64, dataFileIds []int64) {
 }
 
 func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
-	var (
-		off      int64
-		f        *fileRecovery
-		fID      int64
-		dataInTx core.DataInTx
-	)
+	var dataInTx core.DataInTx
+	fullScanAfterFail := false
+
+	for _, dataID := range dataFileIds {
+		// Hint files are safe shortcuts for sealed files. The highest user
+		// file is the active file and may contain appends that are not (yet)
+		// represented by its hint, so always scan it. This also initializes
+		// ActiveFile.writeOff/ActualSize to the true prefix boundary.
+		if db.opt.EnableHintFile && dataID != db.MaxFileID {
+			// loadHintFile validates every hint against its data record before
+			// mutating the index. A non-nil error means applying a validated
+			// hint failed after partial updates, so discard the whole index and
+			// perform a complete data-file scan.
+			hintLoaded, hintErr := db.loadHintFile(dataID)
+			if hintErr != nil {
+				utils.GetLogger().Printf("hint index %d failed during rebuild, falling back to full scan: %v", dataID, hintErr)
+				fullScanAfterFail = true
+				break
+			}
+
+			if hintLoaded {
+				// Hint file was validated and loaded successfully.
+				continue
+			}
+		}
+
+		// Fall back to scanning the data file. dataInTx is shared because a
+		// large transaction can roll across segment files and only its final
+		// entry carries the Committed status.
+		if err = db.scanDataFile(dataID, &dataInTx); err != nil {
+			return err
+		}
+	}
+
+	if fullScanAfterFail {
+		db.discardRebuildIndex()
+		if err = db.scanDataFiles(dataFileIds); err != nil {
+			return err
+		}
+	}
+	// compute the valid record count and save it in db.RecordCount
+	db.RecordCount, err = db.getRecordCount()
+	return
+}
+
+func (db *DB) scanDataFiles(dataFileIds []int64) error {
+	var dataInTx core.DataInTx
+	for _, dataID := range dataFileIds {
+		if err := db.scanDataFile(dataID, &dataInTx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// discardRebuildIndex drops a partially rebuilt in-memory index. Startup is
+// single-threaded and the writer goroutine has not started yet, so replacing
+// the maps is sufficient to ensure a failed hint rebuild cannot leave a
+// half-populated index behind for the full scan.
+func (db *DB) discardRebuildIndex() {
+	db.Index = db.newIndex()
+	db.KeyCount = 0
+	db.RecordCount = 0
+	if db.hintKeyAndRAMIdxModeLru != nil {
+		db.hintKeyAndRAMIdxModeLru.Clear()
+	}
+}
+
+func isRecoverableRecordBoundary(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, ErrIndexOutOfBound) ||
+		errors.Is(err, ErrEntryZero) ||
+		errors.Is(err, ErrCrc) ||
+		errors.Is(err, core.ErrHeaderSizeOutOfBounds)
+}
+
+func (db *DB) scanDataFile(fID int64, dataInTx *core.DataInTx) error {
+	var off int64
+
+	dataPath := getDataPath(fID, db.opt.Dir)
+	f, err := newFileRecovery(dataPath, db.opt.BufferSizeOfRecovery)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = f.release()
+	}()
 
 	parseDataInTx := func() error {
 		for _, entry := range dataInTx.Es {
@@ -564,102 +670,72 @@ func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
 			}
 
 			db.KeyCount++
-
 		}
 		return nil
 	}
 
-	readEntriesFromFile := func() error {
-		for {
-			entry, err := f.readEntry(off)
-			if err != nil {
-				// whatever which logic branch it will choose, we will release the fd.
-				_ = f.release()
-				if errors.Is(err, io.EOF) || errors.Is(err, ErrIndexOutOfBound) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrEntryZero) || errors.Is(err, core.ErrHeaderSizeOutOfBounds) {
-					break
+	for {
+		entry, nextOff, readErr := f.readEntryWithOffset(off)
+		if readErr != nil {
+			if isRecoverableRecordBoundary(readErr) {
+				if errors.Is(readErr, ErrCrc) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+					utils.GetLogger().Printf(
+						"recovering prefix of data file %s at offset %d; ignoring incomplete trailing record: %v",
+						dataPath, off, readErr,
+					)
 				}
-				if off >= db.opt.SegmentSize {
-					break
-				}
-
-				return err
-			}
-
-			if entry == nil {
 				break
 			}
-
-			entryWhenRecovery := &core.EntryWhenRecovery{
-				Entry: *entry,
-				Fid:   fID,
-				Off:   off,
+			if off >= db.opt.SegmentSize {
+				break
 			}
-			if dataInTx.TxId == 0 {
-				dataInTx.AppendEntry(entryWhenRecovery)
-				dataInTx.TxId = entry.Meta.TxID
-				dataInTx.StartOff = off
-			} else if dataInTx.IsSameTx(entryWhenRecovery) {
-				dataInTx.AppendEntry(entryWhenRecovery)
-			}
-
-			if entry.Meta.Status == Committed {
-				err := parseDataInTx()
-				if err != nil {
-					return err
-				}
-				dataInTx.Reset()
-				dataInTx.StartOff = off
-			}
-
-			if !dataInTx.IsSameTx(entryWhenRecovery) {
-				dataInTx.Reset()
-				dataInTx.StartOff = off
-			}
-
-			off += entry.Size()
+			return readErr
 		}
 
-		if fID == db.MaxFileID {
-			db.ActiveFile.ActualSize = off
-			db.ActiveFile.writeOff = off
+		if entry == nil {
+			break
 		}
 
-		return nil
+		entryWhenRecovery := &core.EntryWhenRecovery{
+			Entry: *entry,
+			Fid:   fID,
+			Off:   off,
+		}
+		if dataInTx.TxId == 0 {
+			dataInTx.AppendEntry(entryWhenRecovery)
+			dataInTx.TxId = entry.Meta.TxID
+			dataInTx.StartOff = off
+		} else if dataInTx.IsSameTx(entryWhenRecovery) {
+			dataInTx.AppendEntry(entryWhenRecovery)
+		}
+
+		if entry.Meta.Status == Committed {
+			if err := parseDataInTx(); err != nil {
+				return err
+			}
+			dataInTx.Reset()
+			dataInTx.StartOff = off
+		}
+
+		if !dataInTx.IsSameTx(entryWhenRecovery) {
+			dataInTx.Reset()
+			dataInTx.StartOff = off
+		}
+
+		off = nextOff
 	}
 
-	for _, dataID := range dataFileIds {
-		off = 0
-		fID = dataID
-
-		// Try to load hint file first if enabled
-		if db.opt.EnableHintFile {
-			hintLoaded, _ := db.loadHintFile(fID)
-
-			if hintLoaded {
-				// Hint file loaded successfully, skip scanning data file
-				continue
-			}
-		}
-
-		// Fall back to scanning data file
-		dataPath := getDataPath(fID, db.opt.Dir)
-		f, err = newFileRecovery(dataPath, db.opt.BufferSizeOfRecovery)
-		if err != nil {
-			return err
-		}
-		err = readEntriesFromFile()
-		if err != nil {
-			return err
-		}
-		_ = f.release()
+	if fID == db.MaxFileID {
+		db.ActiveFile.ActualSize = off
+		db.ActiveFile.writeOff = off
 	}
 
-	// compute the valid record count and save it in db.RecordCount
-	db.RecordCount, err = db.getRecordCount()
-	return
+	return nil
 }
 
-// loadHintFile loads a single hint file and rebuilds indexes
+// loadHintFile validates and loads a single hint file. Validation completes
+// before the live index is mutated, so a bad offset/length/checksum causes a
+// false result without leaving a partially rebuilt index for that file.
 func (db *DB) loadHintFile(fid int64) (bool, error) {
 	hintPath := getHintPath(fid, db.opt.Dir)
 
@@ -668,13 +744,26 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 		return false, nil // Hint file doesn't exist, need to scan data file
 	}
 
+	if err := db.verifyHintFile(fid); err != nil {
+		utils.GetLogger().Printf("Hint file %s is unusable, falling back to data scan: %v", hintPath, err)
+		return false, nil
+	}
+
+	if err := db.applyHintFile(fid); err != nil {
+		return false, fmt.Errorf("apply validated hint file %s: %w", hintPath, err)
+	}
+
+	return true, nil
+}
+
+func (db *DB) applyHintFile(fid int64) error {
+	hintPath := getHintPath(fid, db.opt.Dir)
 	reader := &HintFileReader{}
 	if err := reader.Open(hintPath); err != nil {
-		return false, nil
+		return err
 	}
 	defer func() {
 		if err := reader.Close(); err != nil {
-			// Log error but don't fail the operation
 			utils.GetLogger().Printf("Warning: failed to close hint file reader: %v", err)
 		}
 	}()
@@ -683,15 +772,18 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 	for {
 		hintEntry, err := reader.Read()
 		if err != nil {
-			if err == io.EOF {
-				break // End of file
+			if errors.Is(err, io.EOF) {
+				return nil // End of file
 			}
-			return false, nil
+			return err
 		}
 
 		if hintEntry == nil {
 			continue
 		}
+		// The file name is authoritative; this also normalizes synthetic or
+		// older hints that did not fill FileID on every entry.
+		hintEntry.FileID = fid
 
 		// Check if bucket exists
 		bucketId := hintEntry.BucketId
@@ -731,19 +823,17 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 		if db.opt.EntryIdxMode == HintKeyValAndRAMIdxMode {
 			value, err := db.getValueByRecord(record)
 			if err != nil {
-				// If we can't load the value, we can't use this entry in HintKeyValAndRAMIdxMode
-				// Skip this entry and continue
-				continue
+				return err
 			}
 			entry.WithValue(value)
 			record.WithValue(value)
 		} else if db.opt.EntryIdxMode == HintKeyAndRAMIdxMode {
-			// In HintKeyAndRAMIdxMode, for Set data structure, we also need to load the value
-			// because Set uses value hash as the key in its internal map structure
+			// In HintKeyAndRAMIdxMode, for Set/ZSet data structures, we also
+			// need to load the value because Set uses value hash as its key.
 			if hintEntry.Ds == DataStructureSet || hintEntry.Ds == DataStructureSortedSet {
 				value, err := db.getValueByRecord(record)
 				if err != nil {
-					continue
+					return err
 				}
 				entry.WithValue(value)
 				// Don't set record.WithValue for HintKeyAndRAMIdxMode, as we only need it for index building
@@ -752,13 +842,11 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 
 		// Build indexes
 		if err := db.buildIdxes(record, entry); err != nil {
-			continue
+			return err
 		}
 
 		db.KeyCount++
 	}
-
-	return true, nil
 }
 
 func (db *DB) getRecordCount() (int64, error) {
@@ -1028,19 +1116,17 @@ func (db *DB) buildIndexes() (err error) {
 func (db *DB) createRecordByModeWithFidAndOff(fid int64, off uint64, entry *core.Entry) *core.Record {
 	record := core.NewRecord()
 
+	// Hint reload leaves TxID zero, so every index mode keeps the entry position.
 	record.WithKey(entry.Key).
 		WithTimestamp(entry.Meta.Timestamp).
 		WithTTL(entry.Meta.TTL).
-		WithTxID(entry.Meta.TxID)
+		WithTxID(entry.Meta.TxID).
+		WithFileId(fid).
+		WithDataPos(off).
+		WithValueSize(uint32(len(entry.Value)))
 
 	if db.opt.EntryIdxMode == HintKeyValAndRAMIdxMode {
 		record.WithValue(entry.Value)
-	}
-
-	if db.opt.EntryIdxMode == HintKeyAndRAMIdxMode {
-		record.WithFileId(fid).
-			WithDataPos(off).
-			WithValueSize(uint32(len(entry.Value)))
 	}
 
 	return record

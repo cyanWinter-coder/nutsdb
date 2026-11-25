@@ -159,25 +159,54 @@ func (e *Entry) ParseMeta(buf []byte) (int64, error) {
 	e.Meta.WithCrc(binary.LittleEndian.Uint32(buf[0:4]))
 
 	index := 4
+	readUvarint := func() (uint64, error) {
+		if index >= len(buf) {
+			return 0, ErrHeaderSizeOutOfBounds
+		}
+		value, n := binary.Uvarint(buf[index:])
+		if n <= 0 {
+			return 0, ErrHeaderSizeOutOfBounds
+		}
+		index += n
+		return value, nil
+	}
 
-	timestamp, n := binary.Uvarint(buf[index:])
-	index += n
-	keySize, n := binary.Uvarint(buf[index:])
-	index += n
-	valueSize, n := binary.Uvarint(buf[index:])
-	index += n
-	flag, n := binary.Uvarint(buf[index:])
-	index += n
-	ttl, n := binary.Uvarint(buf[index:])
-	index += n
-	status, n := binary.Uvarint(buf[index:])
-	index += n
-	ds, n := binary.Uvarint(buf[index:])
-	index += n
-	txId, n := binary.Uvarint(buf[index:])
-	index += n
-	bucketId, n := binary.Uvarint(buf[index:])
-	index += n
+	timestamp, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	keySize, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	valueSize, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	flag, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	ttl, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	status, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	ds, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	txId, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	bucketId, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
 
 	e.Meta.
 		WithTimeStamp(timestamp).
