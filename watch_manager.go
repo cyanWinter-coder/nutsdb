@@ -24,6 +24,11 @@ var (
 	ErrWatchingChannelClosed    = errors.New("watching channel closed")
 	ErrChannelNotAvailable      = errors.New("channel not available")
 	ErrCloseWatchManagerTimeout = errors.New("close watch manager timeout")
+	// ErrSubscriberBacklogExceeded is returned (and recorded on the
+	// subscriber) when a subscriber cannot keep up with the event stream and
+	// its backlog grows past the configured limit. The offending subscription
+	// is disconnected; other subscriptions are not affected.
+	ErrSubscriberBacklogExceeded = errors.New("subscriber backlog exceeded limit")
 )
 
 // convert these variables to var for testing
@@ -38,6 +43,9 @@ var (
 
 const (
 	DefaultCallbackTimeout = 1 * time.Second
+	// defaultCloseDrainTimeout bounds how long the watch manager keeps
+	// flushing already-enqueued events to subscribers during shutdown.
+	defaultCloseDrainTimeout = 5 * time.Second
 )
 
 // message priority
@@ -67,7 +75,14 @@ type Message struct {
 	Value      []byte
 	Flag       DataFlag
 	Timestamp  uint64
-	priority   MessagePriority
+	// TxID identifies the committing transaction. All messages sharing the
+	// same TxID are delivered consecutively and in commit order.
+	TxID uint64
+	// Seq is the position of the message within its committing transaction
+	// (starting at 0), allowing consumers to verify delivery order.
+	Seq uint64
+
+	priority MessagePriority
 }
 
 func NewMessage(bucketName core.BucketName, key string, value []byte, flag DataFlag, timestamp uint64, options ...MessageOptions) *Message {
@@ -101,17 +116,48 @@ func (opts *WatchOptions) WithCallbackTimeout(timeout time.Duration) {
 }
 
 type subscriber struct {
-	id           uint64
-	bucketName   core.BucketName
-	key          string
-	receiveChan  chan *Message
+	id          uint64
+	bucketName  core.BucketName
+	key         string
+	receiveChan chan *Message
+	// deadMessages counts consecutive events that could not be pushed into
+	// receiveChan because the subscriber was not consuming them.
 	deadMessages int
 	active       atomic.Bool
+
+	// closeOnce guarantees the receive channel is closed exactly once no
+	// matter how many paths (unsubscribe, slow-consumer eviction, bucket
+	// deletion, manager shutdown) race to disconnect the subscriber.
+	closeOnce sync.Once
+	// disconnectErr records why the channel was closed so consumers can
+	// distinguish a backlog eviction from an ordinary unsubscribe/shutdown.
+	disconnectErr atomic.Value // error
+}
+
+// closeChannel closes the subscriber's receive channel at most once and marks
+// the subscriber inactive. It is safe to call concurrently from any goroutine.
+func (s *subscriber) closeChannel(err error) {
+	s.closeOnce.Do(func() {
+		if err != nil {
+			s.disconnectErr.Store(err)
+		}
+		s.active.Store(false)
+		close(s.receiveChan)
+	})
+}
+
+// disconnectReason returns the error that caused the channel to close, or
+// ErrWatchingChannelClosed for an ordinary shutdown/unsubscribe.
+func (s *subscriber) disconnectReason() error {
+	if err, ok := s.disconnectErr.Load().(error); ok && err != nil {
+		return err
+	}
+	return ErrWatchingChannelClosed
 }
 
 type watchManager struct {
 	lookup         bucketToSubscribers // bucketName -> key -> id -> subscriber
-	watchChan      chan *Message       // the hub channel to receive the messages
+	watchChan      chan *Message       // the hub channel to receive the messages; never closed
 	distributeChan chan []*Message     // the collector worker collects messages from watchChan and sends them to the distributor worker through distributeChan
 	victimMaps     victimBucketToSubscribers
 	victimChan     victimBucketChan
@@ -150,28 +196,37 @@ func (wm *watchManager) Name() string {
 	return "WatchManager"
 }
 
-// send a message to the watch manager
+// sendMessage enqueues a message without ever blocking on subscriber
+// consumption. A full hub channel means the write path is not keeping up with
+// the collector; the event is rejected with an identifiable error instead of
+// blocking the committing transaction.
 func (wm *watchManager) sendMessage(message *Message) error {
 	if wm.isClosed() {
 		return ErrWatchManagerClosed
 	}
 
-	// the high priority messages must be ensured to push to the watch channel
-	if message.priority == MessagePriorityHigh {
-		select {
-		case wm.watchChan <- message:
-			utils.GetLogger().Printf("[watch_manager] Sent high priority message %s/%s to watch channel\n", message.BucketName, message.Key)
-		case <-wm.workerCtx.Done():
-			return ErrWatchManagerClosed
-		}
+	select {
+	case <-wm.workerCtx.Done():
+		return ErrWatchManagerClosed
+	default:
 	}
 
 	select {
 	case wm.watchChan <- message:
 		return nil
-	case <-wm.workerCtx.Done():
-		return ErrWatchManagerClosed
 	default:
+		if message.priority == MessagePriorityHigh {
+			// High-priority events (e.g. bucket deletion) are allowed to wait
+			// for hub capacity, but shutdown always wins and the wait never
+			// blocks a closing database.
+			select {
+			case wm.watchChan <- message:
+				utils.GetLogger().Printf("[watch_manager] Sent high priority message %s/%s to watch channel\n", message.BucketName, message.Key)
+				return nil
+			case <-wm.workerCtx.Done():
+				return ErrWatchManagerClosed
+			}
+		}
 		return ErrWatchChanCannotSend
 	}
 }
@@ -181,8 +236,10 @@ func (wm *watchManager) sendUpdatedEntries(entries []*core.Entry, deletedbuckets
 		return ErrWatchManagerClosed
 	}
 
-	// send all updated entries to the watch manager
+	// send all updated entries to the watch manager; entries are committed in
+	// slice order, which also fixes their delivery order.
 	if len(entries) > 0 {
+		seqByTx := make(map[uint64]uint64)
 		for _, entry := range entries {
 			bucketName, err := getBucketName(entry.Meta.BucketId)
 			if err != nil {
@@ -196,6 +253,9 @@ func (wm *watchManager) sendUpdatedEntries(entries []*core.Entry, deletedbuckets
 			}
 
 			message := NewMessage(bucketName, string(rawKey), entry.Value, entry.Meta.Flag, entry.Meta.Timestamp)
+			message.TxID = entry.Meta.TxID
+			message.Seq = seqByTx[entry.Meta.TxID]
+			seqByTx[entry.Meta.TxID]++
 			if err := wm.sendMessage(message); err != nil {
 				return err
 			}
@@ -243,99 +303,110 @@ func (wm *watchManager) startDistributor() {
 	wm.wg.Wait()
 }
 
-// runCollector collects messages from watchChan and batches them
+// collectorFlushInterval bounds how long a partially filled batch waits in
+// the collector before being handed to the distributor. A steady flush
+// cadence keeps healthy subscriber channels draining instead of receiving
+// giant spikes that look like a slow-consumer backlog.
+var collectorFlushInterval = 5 * time.Millisecond
+
+// runCollector collects messages from watchChan and batches them.
+// watchChan is intentionally never closed: producers stop sending once the
+// manager is marked closed, and the collector drains everything already
+// enqueued before exiting, then closes distributeChan to signal the
+// distributor.
 func (wm *watchManager) runCollector() {
 	batches := make([]*Message, 0, maxBatchSize)
+	flushTicker := time.NewTicker(collectorFlushInterval)
+	defer flushTicker.Stop()
+
+	flush := func() {
+		if len(batches) == 0 {
+			return
+		}
+		wm.sendBatchToDistributor(batches)
+		batches = batches[:0]
+	}
 
 	defer func() {
-		// drain and send final batch before exiting
+		// drain any events that arrived between the last batch flush and the
+		// shutdown signal so already-enqueued events get a chance of delivery
+		wm.drainWatchChan(&batches)
 		if len(batches) > 0 {
-			select {
-			case wm.distributeChan <- batches:
-			default:
-				utils.GetLogger().Printf("[watch_manager] Dropping final batch of %d messages\n", len(batches))
-			}
+			wm.deliverFinalBatch(batches)
 		}
-
 		close(wm.distributeChan)
-		close(wm.watchChan)
 	}()
-
-	sendBatchToDistributor := func(batch []*Message) {
-		sendBatch := make([]*Message, len(batch))
-		copy(sendBatch, batch)
-
-		select {
-		case wm.distributeChan <- sendBatch:
-		case <-wm.workerCtx.Done():
-		default:
-			utils.GetLogger().Printf("[watch_manager] Distribution channel full, dropping batch of %d messages\n", len(sendBatch))
-		}
-	}
 
 	for {
 		select {
-		case msg, ok := <-wm.watchChan:
-			if !ok {
-				return
-			}
+		case msg := <-wm.watchChan:
 			batches = append(batches, msg)
+			if len(batches) >= maxBatchSize {
+				flush()
+			}
+		case <-flushTicker.C:
+			flush()
 		case <-wm.workerCtx.Done():
 			return
-		}
-
-	accumulate:
-		for {
-			if len(batches) >= maxBatchSize {
-				sendBatchToDistributor(batches)
-				batches = batches[:0]
-				break accumulate
-			}
-
-			select {
-			case msg, ok := <-wm.watchChan:
-				if !ok {
-					return
-				}
-				batches = append(batches, msg)
-			case <-wm.workerCtx.Done():
-				return
-
-			default:
-				if len(batches) > 0 {
-					sendBatchToDistributor(batches)
-					batches = batches[:0]
-				}
-				break accumulate
-			}
 		}
 	}
 }
 
-// runDistributor distributes batches to subscribers
-func (wm *watchManager) runDistributor() {
+// drainWatchChan non-blockingly pulls every currently buffered hub message
+// into the batch. Used during shutdown to salvage queued events.
+func (wm *watchManager) drainWatchChan(batches *[]*Message) {
 	for {
 		select {
-		case batch, ok := <-wm.distributeChan:
-			if !ok {
-				return
-			}
-			_ = wm.distributeAllMessages(batch)
-
-		case <-wm.workerCtx.Done():
-			// drain the distribute channel
-			for {
-				select {
-				case batch, ok := <-wm.distributeChan:
-					if !ok {
-						return
-					}
-					_ = wm.distributeAllMessages(batch)
-				default:
-					return
-				}
-			}
+		case msg := <-wm.watchChan:
+			*batches = append(*batches, msg)
+		default:
+			return
 		}
+	}
+}
+
+// deliverFinalBatch hands one last batch to the distributor during shutdown.
+// It blocks until the distributor accepts the batch or the manager is fully
+// torn down; Stop's timeout bounds how long callers wait overall.
+func (wm *watchManager) deliverFinalBatch(batch []*Message) {
+	sendBatch := make([]*Message, len(batch))
+	copy(sendBatch, batch)
+
+	select {
+	case wm.distributeChan <- sendBatch:
+	default:
+		// Distributor may have already exited; do not block shutdown forever.
+		utils.GetLogger().Printf("[watch_manager] Dropping final batch of %d messages during shutdown\n", len(sendBatch))
+	}
+}
+
+// sendBatchToDistributor hands a batch to the distributor. Backpressure here
+// is confined to the collector goroutine — commit-path producers only interact
+// with the buffered watchChan — so blocking on capacity never stalls a
+// transaction. Shutdown still wins via the worker context.
+func (wm *watchManager) sendBatchToDistributor(batch []*Message) {
+	sendBatch := make([]*Message, len(batch))
+	copy(sendBatch, batch)
+
+	select {
+	case wm.distributeChan <- sendBatch:
+	case <-wm.workerCtx.Done():
+		// On shutdown make one last non-blocking attempt, otherwise the
+		// batch is abandoned.
+		select {
+		case wm.distributeChan <- sendBatch:
+		default:
+			utils.GetLogger().Printf("[watch_manager] Dropping batch of %d messages during shutdown\n", len(sendBatch))
+		}
+	}
+}
+
+// runDistributor distributes batches to subscribers. It exits only after
+// distributeChan is closed and fully drained, so events enqueued before
+// shutdown are delivered as long as subscribers accept them.
+func (wm *watchManager) runDistributor() {
+	for batch := range wm.distributeChan {
+		_ = wm.distributeAllMessages(batch)
 	}
 }
 
@@ -354,59 +425,75 @@ func (wm *watchManager) runVictimCollector() {
 				return
 			}
 
-			for identifierId, bucketMap := range victimBucketToSubscribers {
-				for key, keyMap := range bucketMap {
-					for _, subscriber := range keyMap {
-						if subscriber.active.Load() {
-							message := NewMessage(subscriber.bucketName, subscriber.key, nil, DataBucketDeleteFlag, uint64(time.Now().Unix()))
-							select {
-							case subscriber.receiveChan <- message:
-							default:
-								// drop the message
-							}
-							close(subscriber.receiveChan)
-							subscriber.active.Store(false)
-						}
-						delete(keyMap, subscriber.id)
-					}
-					delete(bucketMap, key)
-				}
-				delete(victimBucketToSubscribers, identifierId)
-			}
+			wm.handleVictimBuckets(victimBucketToSubscribers)
 		case <-ticker.C:
 			// avoid busy spinning
 		case <-wm.workerCtx.Done():
+			// Shutdown: non-blockingly process everything already queued so
+			// victim subscribers still get their delete notification.
+			wm.drainVictimBuckets()
 			return
 		}
 	}
 }
 
-// distribute the messages to the subscribers
+// drainVictimBuckets processes every victim map already buffered without
+// waiting for new ones.
+func (wm *watchManager) drainVictimBuckets() {
+	for {
+		select {
+		case victimBucketToSubscribers, ok := <-wm.victimChan:
+			if !ok {
+				return
+			}
+			wm.handleVictimBuckets(victimBucketToSubscribers)
+		default:
+			return
+		}
+	}
+}
+
+func (wm *watchManager) handleVictimBuckets(victimBucketToSubscribers victimBucketToSubscribers) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+
+	wm.handleVictimBucketsLocked(victimBucketToSubscribers)
+}
+
+// handleVictimBucketsLocked performs the victim processing. The caller must
+// hold wm.mu (the distributor calls it from deleteBucket while already
+// holding the lock).
+func (wm *watchManager) handleVictimBucketsLocked(victimBucketToSubscribers victimBucketToSubscribers) {
+	for identifierId, bucketMap := range victimBucketToSubscribers {
+		for key, keyMap := range bucketMap {
+			for _, sub := range keyMap {
+				if sub.active.Load() {
+					message := NewMessage(sub.bucketName, sub.key, nil, DataBucketDeleteFlag, uint64(time.Now().Unix()))
+					select {
+					case sub.receiveChan <- message:
+					default:
+						// drop the message; the channel close still follows
+					}
+					sub.closeChannel(nil)
+				}
+				delete(keyMap, sub.id)
+			}
+			delete(bucketMap, key)
+		}
+		delete(victimBucketToSubscribers, identifierId)
+	}
+}
+
+// distribute the messages to the subscribers.
+// The lock only guards the lookup table; every channel send is non-blocking,
+// so a slow subscriber can never stall the distributor, the commit path or
+// any other subscriber.
 func (wm *watchManager) distributeAllMessages(messages []*Message) error {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
 	if len(messages) == 0 {
 		return nil
-	}
-
-	dropMessage := func(message *Message, subscriber *subscriber) {
-		utils.GetLogger().Printf("[watch_manager] Force-unsubscribing slow subscriber with id %d for message %s/%s\n",
-			subscriber.id, message.BucketName, message.Key)
-
-		if _, err := wm.findSubscriber(message.BucketName, message.Key, subscriber.id); err == nil {
-			delete(wm.lookup[message.BucketName][message.Key], subscriber.id)
-			if len(wm.lookup[message.BucketName][message.Key]) == 0 {
-				delete(wm.lookup[message.BucketName], message.Key)
-			}
-			if len(wm.lookup[message.BucketName]) == 0 {
-				delete(wm.lookup, message.BucketName)
-			}
-			if subscriber.active.Load() {
-				close(subscriber.receiveChan)
-				subscriber.active.Store(false)
-			}
-		}
 	}
 
 	for _, message := range messages {
@@ -428,26 +515,47 @@ func (wm *watchManager) distributeAllMessages(messages []*Message) error {
 		}
 
 		// avoid blocking the distributor, all messages blocked will be dropped
-		for _, subscriber := range subscriberMap {
-			if !subscriber.active.Load() {
-				utils.GetLogger().Printf("[watch_manager] Skipping inactive subscriber with id %d for message %s/%s\n", subscriber.id, message.BucketName, message.Key)
+		for _, sub := range subscriberMap {
+			if !sub.active.Load() {
+				utils.GetLogger().Printf("[watch_manager] Skipping inactive subscriber with id %d for message %s/%s\n", sub.id, message.BucketName, message.Key)
 				continue
 			}
 
 			select {
-			case subscriber.receiveChan <- message:
-				subscriber.deadMessages = 0
+			case sub.receiveChan <- message:
+				sub.deadMessages = 0
 			default:
-				// when the messages are not pushed to dropChan, we consider it as dead
-				subscriber.deadMessages++
-				if subscriber.deadMessages >= deadMessageThreshold {
-					dropMessage(message, subscriber)
+				// the subscriber is not consuming; count the backlog and
+				// disconnect only this subscriber once the limit is reached.
+				sub.deadMessages++
+				if sub.deadMessages >= deadMessageThreshold {
+					wm.evictSubscriber(message, sub)
 				}
 			}
 		}
 	}
 
 	return nil
+}
+
+// evictSubscriber removes a slow subscriber from the lookup and closes its
+// channel exactly once with an identifiable backlog error. Must be called
+// with wm.mu held.
+func (wm *watchManager) evictSubscriber(message *Message, sub *subscriber) {
+	utils.GetLogger().Printf("[watch_manager] Force-unsubscribing slow subscriber with id %d for message %s/%s after %d undeliverable messages\n",
+		sub.id, message.BucketName, message.Key, sub.deadMessages)
+
+	if _, err := wm.findSubscriber(message.BucketName, message.Key, sub.id); err == nil {
+		delete(wm.lookup[message.BucketName][message.Key], sub.id)
+		if len(wm.lookup[message.BucketName][message.Key]) == 0 {
+			delete(wm.lookup[message.BucketName], message.Key)
+		}
+		if len(wm.lookup[message.BucketName]) == 0 {
+			delete(wm.lookup, message.BucketName)
+		}
+	}
+
+	sub.closeChannel(ErrSubscriberBacklogExceeded)
 }
 
 // subscribe to the key and bucket
@@ -484,14 +592,19 @@ func (wm *watchManager) subscribe(bucketName core.BucketName, key string) (*subs
 	return &registeredSubscriber, nil
 }
 
-// unsubscribe from the key and bucket
+// unsubscribe removes a subscriber and closes its channel. It is idempotent:
+// after the first call — including any eviction, bucket deletion or manager
+// shutdown that already disconnected the subscriber — repeat calls are
+// no-ops that return nil, and the channel is closed at most once.
 func (wm *watchManager) unsubscribe(bucketName core.BucketName, key string, id core.BucketId) error {
 	wm.mu.Lock()
 	defer wm.mu.Unlock()
 
-	subscriber, err := wm.findSubscriber(bucketName, key, id)
+	sub, err := wm.findSubscriber(bucketName, key, id)
 	if err != nil {
-		return err
+		// Already removed (duplicate unsubscribe, eviction, bucket delete or
+		// shutdown): nothing to do and nothing to report.
+		return nil
 	}
 
 	// Clean up the subscriber
@@ -503,11 +616,8 @@ func (wm *watchManager) unsubscribe(bucketName core.BucketName, key string, id c
 		delete(wm.lookup, bucketName)
 	}
 
-	// Close channel if still active
-	if subscriber.active.Load() {
-		close(subscriber.receiveChan)
-		subscriber.active.Store(false)
-	}
+	// closeChannel is a once-only operation.
+	sub.closeChannel(nil)
 
 	return nil
 }
@@ -518,12 +628,9 @@ func (wm *watchManager) cleanUpSubscribers() {
 
 	for bucket, bucketMap := range wm.lookup {
 		for key, keyMap := range bucketMap {
-			for _, subscriber := range keyMap {
-				if subscriber.active.Load() {
-					close(subscriber.receiveChan)
-					subscriber.active.Store(false)
-				}
-				delete(keyMap, subscriber.id)
+			for _, sub := range keyMap {
+				sub.closeChannel(nil)
+				delete(keyMap, sub.id)
 			}
 			delete(bucketMap, key)
 		}
@@ -531,6 +638,11 @@ func (wm *watchManager) cleanUpSubscribers() {
 	}
 }
 
+// close marks the manager as shutting down and cancels the worker context.
+// It never blocks: producers stop accepting new events immediately, while the
+// worker goroutines drain already-enqueued events in the background. Use
+// Stop to wait for that drain with a timeout.
+// close is idempotent; repeat calls return ErrWatchManagerClosed.
 func (wm *watchManager) close() error {
 	wm.muClosed.Lock()
 	defer wm.muClosed.Unlock()
@@ -539,8 +651,8 @@ func (wm *watchManager) close() error {
 		return ErrWatchManagerClosed
 	}
 
-	wm.workerCancel()
 	wm.closed = true
+	wm.workerCancel()
 
 	return nil
 }
@@ -553,8 +665,8 @@ func (wm *watchManager) findSubscriber(bucketName core.BucketName, key string, i
 		return nil, ErrKeySubscriberNotFound
 	}
 
-	if subscriber, ok := wm.lookup[bucketName][key][id]; ok {
-		return subscriber, nil
+	if sub, ok := wm.lookup[bucketName][key][id]; ok {
+		return sub, nil
 	}
 	return nil, ErrSubscriberNotFound
 }
@@ -590,17 +702,17 @@ func (wm *watchManager) deleteBucket(deletingMessageBucket Message) {
 	// Log before sending to avoid race condition with victimCollector
 	utils.GetLogger().Printf("[watch_manager] Moving bucket %s to victim channel (identifier: %d)\n", bucketName, identifierId)
 
-	// wait for the victim channel to be available
-	timeOut := time.After(10 * time.Second)
-	for {
-		select {
-		case <-timeOut:
-			utils.GetLogger().Printf("[watch_manager] Timeout sending victim bucket %s to channel\n", bucketName)
-			return
-		case wm.victimChan <- victimBucketToSubscribers:
-			// Successfully sent - victimCollector now owns the map, don't access it anymore
-			return
-		}
+	// Hand off without blocking the distributor (and therefore the commit
+	// path). If the victim channel is full, close the victim subscribers
+	// inline so their channels still terminate promptly.
+	select {
+	case wm.victimChan <- victimBucketToSubscribers:
+		// Successfully sent - victimCollector now owns the map, don't access it anymore
+	default:
+		utils.GetLogger().Printf("[watch_manager] Victim channel full, closing bucket %s subscribers inline\n", bucketName)
+		// deleteBucket is invoked from distributeAllMessages while wm.mu is
+		// already held, so use the lock-free helper.
+		wm.handleVictimBucketsLocked(victimBucketToSubscribers)
 	}
 }
 
@@ -611,14 +723,14 @@ func (wm *watchManager) Start(ctx context.Context) error {
 		return ErrWatchManagerClosed
 	}
 
-	wm.muStarted.RLock()
+	wm.muStarted.Lock()
 	if wm.started {
-		wm.muStarted.RUnlock()
+		wm.muStarted.Unlock()
 		return nil
 	}
 
 	wm.started = true
-	wm.muStarted.RUnlock()
+	wm.muStarted.Unlock()
 
 	// use a local ready channel to wait for goroutine startup
 	ready := make(chan struct{})
@@ -638,22 +750,29 @@ func (wm *watchManager) Start(ctx context.Context) error {
 	}
 }
 
-// Stop stops the watch manager
-// Notifies all subscribers that the database is closing and closes all subscription channels
-// Implements Component interface
+// Stop stops the watch manager.
+// New events are rejected immediately; already-enqueued events are flushed to
+// subscribers for up to timeout before all subscriber channels are closed.
+// Implements Component interface.
 func (wm *watchManager) Stop(timeout time.Duration) (err error) {
-	closeChan := make(chan struct{})
+	if err := wm.close(); err != nil {
+		// Idempotent: a second Stop reports the manager was already closed.
+		return err
+	}
 
-	// close watch manager
-	// this cancels context and signals all goroutines to stop
+	done := make(chan struct{})
 	go func() {
-		err = wm.close()
-		close(closeChan)
+		wm.wg.Wait()
+		close(done)
 	}()
 
+	if timeout <= 0 {
+		timeout = defaultCloseDrainTimeout
+	}
+
 	select {
-	case <-closeChan:
-		return err
+	case <-done:
+		return nil
 	case <-time.After(timeout):
 		return ErrCloseWatchManagerTimeout
 	}

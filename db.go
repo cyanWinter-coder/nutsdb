@@ -1253,10 +1253,11 @@ func (db *DB) Watch(ctx context.Context, bucket string, key []byte, cb func(mess
 		defer func() {
 			ticker.Stop()
 
-			if subscriber != nil && subscriber.active.Load() {
-				if err := db.watchMgr.unsubscribe(bucket, keyWatch, subscriber.id); err != nil {
-					// ignore the error
-				}
+			// unsubscribe is idempotent: after an eviction, bucket deletion
+			// or manager shutdown this is a no-op and the channel was closed
+			// exactly once by the manager.
+			if err := db.watchMgr.unsubscribe(bucket, keyWatch, subscriber.id); err != nil {
+				// ignore the error
 			}
 		}()
 
@@ -1280,6 +1281,12 @@ func (db *DB) Watch(ctx context.Context, bucket string, key []byte, cb func(mess
 						return err
 					}
 
+					// An ordinary close (unsubscribe, bucket deletion,
+					// shutdown) ends the watch without error. A slow-consumer
+					// eviction surfaces the identifiable backlog error.
+					if errors.Is(subscriber.disconnectReason(), ErrSubscriberBacklogExceeded) {
+						return subscriber.disconnectReason()
+					}
 					return nil
 				}
 
