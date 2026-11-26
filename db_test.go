@@ -196,8 +196,16 @@ func txGetMaxOrMinKey(t *testing.T, db *DB, bucket string, isMax bool, expectVal
 
 func txDeleteBucket(t *testing.T, db *DB, ds uint16, bucket string, expectErr error) {
 	err := db.Update(func(tx *Tx) error {
-		err := tx.DeleteBucket(ds, bucket)
-		AssertErr(t, err, expectErr)
+		var err2 error
+		if expectErr == nil {
+			// Existing setup/teardown helpers historically removed buckets
+			// with data. Use the explicit force API for that cleanup path;
+			// assertions for rejection errors still exercise DeleteBucket.
+			err2 = tx.DeleteBucketForce(ds, bucket)
+		} else {
+			err2 = tx.DeleteBucket(ds, bucket)
+		}
+		AssertErr(t, err2, expectErr)
 		return nil
 	})
 	require.NoError(t, err)

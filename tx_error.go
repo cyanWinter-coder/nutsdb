@@ -52,7 +52,14 @@ var (
 	// ErrTxnExceedWriteLimit is returned when this tx's write is exceed max write record
 	ErrTxnExceedWriteLimit = errors.New("txn is exceed max write record count")
 
-	ErrBucketAlreadyExist = errors.New("bucket is already exist")
+	ErrBucketAlreadyExist  = errors.New("bucket is already exist")
+	ErrBucketAlreadyExists = ErrBucketAlreadyExist
+
+	// ErrBucketNotEmpty is returned when a caller tries to delete a bucket
+	// that still contains live data.
+	ErrBucketNotEmpty   = errors.New("bucket is not empty")
+	ErrBucketIsNotEmpty = ErrBucketNotEmpty
+	ErrNonEmptyBucket   = ErrBucketNotEmpty
 
 	ErrValueNotInteger = errors.New("value is not an integer")
 

@@ -1525,7 +1525,7 @@ func TestBTreeInternalVisibility(t *testing.T) {
 			value, err := tx.Get(bucket, key)
 			assert.Nil(t, err)
 			assert.Equal(t, "test-updated", string(value))
-			err = tx.DeleteBucket(DataStructureBTree, bucket)
+			err = tx.DeleteBucketForce(DataStructureBTree, bucket)
 			assert.Nil(t, err)
 			err = tx.Put(bucket, key, []byte("test-updated"), Persistent)
 			assert.Equal(t, ErrBucketNotFound, err)

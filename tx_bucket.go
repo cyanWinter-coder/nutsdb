@@ -89,7 +89,20 @@ func (tx *Tx) NewSortSetBucket(name string) error {
 }
 
 func (tx *Tx) NewBucket(ds uint16, name string) (err error) {
-	if tx.ExistBucket(ds, name) {
+	if err := tx.checkTxIsClosed(); err != nil {
+		return err
+	}
+	switch ds {
+	case DataStructureBTree, DataStructureList, DataStructureSet, DataStructureSortedSet:
+	default:
+		return ErrDataStructureNotSupported
+	}
+
+	// Reject a duplicate that is already committed or newly added/updated in
+	// this transaction. A pending delete is allowed to be replaced by a new
+	// creation in the same transaction.
+	switch status, _ := tx.getBucketAndItsStatus(ds, name); status {
+	case BucketStatusNew, BucketStatusExistAlready, BucketStatusUpdated:
 		return ErrBucketAlreadyExist
 	}
 	bucket := &core.Bucket{
@@ -107,8 +120,21 @@ func (tx *Tx) NewBucket(ds uint16, name string) (err error) {
 	return nil
 }
 
-// DeleteBucket delete bucket depends on ds (represents the data structure)
+// DeleteBucket delete bucket depends on ds (represents the data structure).
+// Buckets that still contain live records are rejected so callers cannot end
+// up with committed metadata/indexes pointing at a half-deleted bucket.
 func (tx *Tx) DeleteBucket(ds uint16, bucket string) error {
+	return tx.deleteBucket(ds, bucket, false)
+}
+
+// DeleteBucketForce removes a bucket even when it currently contains data. It
+// preserves the historical cascade-delete behavior for callers that explicitly
+// opt into dropping data.
+func (tx *Tx) DeleteBucketForce(ds uint16, bucket string) error {
+	return tx.deleteBucket(ds, bucket, true)
+}
+
+func (tx *Tx) deleteBucket(ds uint16, bucket string, force bool) error {
 	if err := tx.checkTxIsClosed(); err != nil {
 		return err
 	}
@@ -116,6 +142,16 @@ func (tx *Tx) DeleteBucket(ds uint16, bucket string) error {
 	b, err := tx.db.bucketMgr.GetBucket(ds, bucket)
 	if err != nil {
 		return ErrBucketNotFound
+	}
+
+	if !force {
+		empty, err := tx.bucketIsEmpty(ds, bucket, b)
+		if err != nil {
+			return err
+		}
+		if !empty {
+			return ErrBucketNotEmpty
+		}
 	}
 
 	deleteBucket := &core.Bucket{
@@ -128,6 +164,45 @@ func (tx *Tx) DeleteBucket(ds uint16, bucket string) error {
 	}
 
 	return tx.putBucket(deleteBucket)
+}
+
+// bucketIsEmpty inspects every known ID for a possibly duplicated bucket name.
+func (tx *Tx) bucketIsEmpty(ds core.Ds, name string, primary *core.Bucket) (bool, error) {
+	ids := tx.db.bucketMgr.BucketIDsByName(ds, name)
+	if len(ids) == 0 && primary != nil {
+		ids = []core.BucketId{primary.Id}
+	}
+
+	for _, id := range ids {
+		if !tx.db.isBucketEmpty(ds, id) {
+			return false, nil
+		}
+	}
+
+	return !tx.pendingWriteAddsToBucket(ds, name), nil
+}
+
+// pendingWriteAddsToBucket reports whether the current transaction has an
+// uncommitted non-delete write destined for the bucket.
+func (tx *Tx) pendingWriteAddsToBucket(ds core.Ds, name string) bool {
+	if tx.pendingWrites == nil {
+		return false
+	}
+
+	if ds == DataStructureBTree {
+		for _, entry := range tx.pendingWrites.entriesInBTree[name] {
+			if entry != nil && entry.Meta != nil && entry.Meta.Flag != DataDeleteFlag {
+				return true
+			}
+		}
+	}
+
+	for _, entry := range tx.pendingWrites.entries[ds][name] {
+		if entry != nil && entry.Meta != nil && entry.Meta.Flag != DataDeleteFlag {
+			return true
+		}
+	}
+	return false
 }
 
 func (tx *Tx) ExistBucket(ds uint16, bucket string) bool {

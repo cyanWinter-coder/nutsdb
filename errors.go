@@ -16,7 +16,22 @@ func IsKeyNotFound(err error) bool {
 
 // IsBucketNotFound is true if the error indicates the bucket is not exists.
 func IsBucketNotFound(err error) bool {
-	return errors.Is(err, ErrBucketNotFound)
+	return errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrBucketNotExist)
+}
+
+// IsBucketAlreadyExist is true if the error indicates the bucket already exists.
+func IsBucketAlreadyExist(err error) bool {
+	return errors.Is(err, ErrBucketAlreadyExist)
+}
+
+// IsBucketAlreadyExists is an alias for IsBucketAlreadyExist.
+func IsBucketAlreadyExists(err error) bool {
+	return IsBucketAlreadyExist(err)
+}
+
+// IsBucketNotEmpty is true if the error indicates the bucket still has data.
+func IsBucketNotEmpty(err error) bool {
+	return errors.Is(err, ErrBucketNotEmpty)
 }
 
 // IsBucketEmpty is true if the bucket is empty.

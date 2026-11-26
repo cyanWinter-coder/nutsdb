@@ -737,10 +737,51 @@ func (tx *Tx) buildBucketInIndex() error {
 				default:
 					return ErrDataStructureNotSupported
 				}
+				tx.pruneOrphanBucketIndexes(bucket.Ds)
 			}
 		}
 	}
 	return nil
+}
+
+// pruneOrphanBucketIndexes removes in-memory bucket indexes whose metadata is
+// gone. Recovery already prevents these orphans from being rebuilt, but a
+// process that observed duplicated metadata can clean them on delete.
+func (tx *Tx) pruneOrphanBucketIndexes(ds uint16) {
+	prune := func(ids []core.BucketId, deleteID func(core.BucketId)) {
+		for _, id := range ids {
+			if _, err := tx.db.bucketMgr.GetBucketById(id); errors.Is(err, ErrBucketNotExist) {
+				deleteID(id)
+			}
+		}
+	}
+
+	switch ds {
+	case DataStructureBTree:
+		ids := make([]core.BucketId, 0, len(tx.db.Index.BTree.Idx))
+		for id := range tx.db.Index.BTree.Idx {
+			ids = append(ids, id)
+		}
+		prune(ids, tx.db.Index.BTree.delete)
+	case DataStructureList:
+		ids := make([]core.BucketId, 0, len(tx.db.Index.List.Idx))
+		for id := range tx.db.Index.List.Idx {
+			ids = append(ids, id)
+		}
+		prune(ids, tx.db.Index.List.delete)
+	case DataStructureSet:
+		ids := make([]core.BucketId, 0, len(tx.db.Index.Set.Idx))
+		for id := range tx.db.Index.Set.Idx {
+			ids = append(ids, id)
+		}
+		prune(ids, tx.db.Index.Set.delete)
+	case DataStructureSortedSet:
+		ids := make([]core.BucketId, 0, len(tx.db.Index.SortedSet.Idx))
+		for id := range tx.db.Index.SortedSet.Idx {
+			ids = append(ids, id)
+		}
+		prune(ids, tx.db.Index.SortedSet.delete)
+	}
 }
 
 func (tx *Tx) getChangeCountInEntriesChanges() (int64, error) {

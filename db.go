@@ -1153,39 +1153,71 @@ func (db *DB) handleExpiredKeys(events []*ttl.ExpirationEvent) {
 	})
 }
 
+// isBucketEmpty reports whether the bucket with the given ID has no live
+// records in the index for its data structure. It reflects committed state.
+func (db *DB) isBucketEmpty(ds uint16, bucketID core.BucketId) bool {
+	switch ds {
+	case DataStructureBTree:
+		if idx, ok := db.Index.BTree.exist(bucketID); ok && idx != nil {
+			return idx.Count() == 0
+		}
+	case DataStructureSet:
+		if idx, ok := db.Index.Set.exist(bucketID); ok && idx != nil {
+			for key := range idx.M {
+				if idx.SCard(key) > 0 {
+					return false
+				}
+			}
+		}
+	case DataStructureSortedSet:
+		if idx, ok := db.Index.SortedSet.exist(bucketID); ok && idx != nil {
+			for key := range idx.M {
+				if count, err := idx.ZCard(key); err == nil && count > 0 {
+					return false
+				}
+			}
+		}
+	case DataStructureList:
+		if idx, ok := db.Index.List.exist(bucketID); ok && idx != nil {
+			for key := range idx.Items {
+				if count, err := idx.Size(key); err == nil && count > 0 {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 func (db *DB) rebuildBucketManager() error {
-	bucketFilePath := db.opt.Dir + "/" + BucketStoreFileName
+	bucketFilePath := filepath.Join(db.opt.Dir, BucketStoreFileName)
 	f, err := newFileRecovery(bucketFilePath, db.opt.BufferSizeOfRecovery)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	bucketRequest := make([]*bucketSubmitRequest, 0)
+	buckets := make([]*core.Bucket, 0)
 
 	for {
 		bucket, err := f.readBucket()
 		if err != nil {
-			// whatever which logic branch it will choose, we will release the fd.
+			// Whatever which logic branch it chooses, release the fd. A torn
+			// tail or CRC mismatch is not a successfully committed record;
+			// stop and replay the valid prefix.
 			_ = f.release()
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) ||
+				errors.Is(err, io.ErrUnexpectedEOF) ||
+				errors.Is(err, core.ErrBucketCrcInvalid) {
 				break
-			} else {
-				return err
 			}
-		}
-		bucketRequest = append(bucketRequest, &bucketSubmitRequest{
-			ds:     bucket.Ds,
-			name:   core.BucketName(bucket.Name),
-			bucket: bucket,
-		})
-	}
-
-	if len(bucketRequest) > 0 {
-		err = db.bucketMgr.SubmitPendingBucketChange(bucketRequest)
-		if err != nil {
 			return err
 		}
+		buckets = append(buckets, bucket)
 	}
-	return nil
+
+	return db.bucketMgr.ReplaceRecoveredBuckets(buckets)
 }
 
 /**
