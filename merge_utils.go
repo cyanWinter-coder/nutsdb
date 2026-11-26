@@ -88,24 +88,3 @@ func enumerateDataFileIDs(dir string) (userIDs []int64, mergeIDs []int64, err er
 	sort.Slice(mergeIDs, func(i, j int) bool { return mergeIDs[i] < mergeIDs[j] })
 	return userIDs, mergeIDs, nil
 }
-
-func purgeMergeFiles(dir string, keep map[int64]struct{}) error {
-	_, mergeIDs, err := enumerateDataFileIDs(dir)
-	if err != nil {
-		return err
-	}
-	for _, fid := range mergeIDs {
-		if keep != nil {
-			if _, ok := keep[fid]; ok {
-				continue
-			}
-		}
-		if err := os.Remove(getDataPath(fid, dir)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.Remove(getHintPath(fid, dir)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
-}

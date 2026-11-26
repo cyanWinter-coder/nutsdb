@@ -58,9 +58,12 @@ func TestMergeV2Manifest(t *testing.T) {
 
 	t.Run("WriteAndLoad", func(t *testing.T) {
 		manifest := &mergeManifest{
-			Status:            manifestStatusWriting,
+			Phase:             phaseRewriting,
 			MergeSeqMax:       3,
 			PendingOldFileIDs: []int64{0, 1, 2, 100, 101},
+			Outputs: []mergeManifestOutput{
+				{Seq: 3, Data: "merge_3.dat", Hint: "merge_3.hint", FileID: GetMergeFileID(3), HasHint: true},
+			},
 		}
 
 		if err := writeMergeManifest(dir, manifest); err != nil {
@@ -74,14 +77,20 @@ func TestMergeV2Manifest(t *testing.T) {
 		if loaded == nil {
 			t.Fatal("loaded manifest is nil")
 		}
-		if loaded.Status != manifestStatusWriting {
-			t.Errorf("Status = %v, want %v", loaded.Status, manifestStatusWriting)
+		if loaded.Phase != phaseRewriting {
+			t.Errorf("Phase = %v, want %v", loaded.Phase, phaseRewriting)
 		}
 		if loaded.MergeSeqMax != 3 {
 			t.Errorf("MergeSeqMax = %d, want 3", loaded.MergeSeqMax)
 		}
 		if len(loaded.PendingOldFileIDs) != 5 {
 			t.Errorf("len(PendingOldFileIDs) = %d, want 5", len(loaded.PendingOldFileIDs))
+		}
+		if len(loaded.Outputs) != 1 || loaded.Outputs[0].Seq != 3 {
+			t.Errorf("Outputs not round-tripped: %+v", loaded.Outputs)
+		}
+		if loaded.Checksum == 0 {
+			t.Error("checksum should be populated on write")
 		}
 	})
 
@@ -190,58 +199,6 @@ func TestEnumerateDataFileIDs(t *testing.T) {
 	expectedMerge1 := GetMergeFileID(1)
 	if mergeIDs[0] != expectedMerge0 || mergeIDs[1] != expectedMerge1 {
 		t.Errorf("mergeIDs = %v, want [%d %d]", mergeIDs, expectedMerge0, expectedMerge1)
-	}
-}
-
-func TestPurgeMergeFiles(t *testing.T) {
-	dir := t.TempDir()
-
-	createFile := func(name string) {
-		f, err := os.Create(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := f.Close(); err != nil {
-			t.Errorf("Failed to close file: %v", err)
-		}
-	}
-
-	createFile("0.dat")
-	createFile("merge_0.dat")
-	createFile("merge_0.hint")
-	createFile("merge_1.dat")
-
-	if err := purgeMergeFiles(dir, nil); err != nil {
-		t.Fatalf("purgeMergeFiles failed: %v", err)
-	}
-
-	// Check that merge files are gone
-	if _, err := os.Stat(filepath.Join(dir, "merge_0.dat")); !os.IsNotExist(err) {
-		t.Error("merge_0.dat should be deleted")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "merge_0.hint")); !os.IsNotExist(err) {
-		t.Error("merge_0.hint should be deleted")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "merge_1.dat")); !os.IsNotExist(err) {
-		t.Error("merge_1.dat should be deleted")
-	}
-
-	keep := map[int64]struct{}{GetMergeFileID(0): {}}
-	createFile("merge_0.dat")
-	createFile("merge_0.hint")
-	if err := purgeMergeFiles(dir, keep); err != nil {
-		t.Fatalf("purgeMergeFiles with keep failed: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "merge_0.dat")); err != nil {
-		t.Error("merge_0.dat should be preserved when kept")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "merge_0.hint")); err != nil {
-		t.Error("merge_0.hint should be preserved when kept")
-	}
-
-	// Check that user file remains
-	if _, err := os.Stat(filepath.Join(dir, "0.dat")); err != nil {
-		t.Error("0.dat should still exist")
 	}
 }
 
@@ -2217,6 +2174,20 @@ func TestMergeV2CrashAfterCommitKeepsData(t *testing.T) {
 		t.Fatalf("merge: expected simulated crash, got %v", err)
 	}
 	mergeV2TestHookCommitted = nil
+
+	// The manifest must already be committed on disk when the process "dies",
+	// which is what authorizes recovery to remove the old files.
+	manifest, err := loadMergeManifest(dir)
+	if err != nil {
+		t.Fatalf("load manifest after crash: %v", err)
+	}
+	if manifest == nil || manifest.Phase != phaseCommitted {
+		t.Fatalf("manifest should be committed, got %+v", manifest)
+	}
+	if len(manifest.Outputs) == 0 {
+		t.Fatal("committed manifest should enumerate the merge outputs")
+	}
+
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}

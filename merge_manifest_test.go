@@ -40,7 +40,7 @@ func TestWriteMergeManifestPropagatesWriteAndRenameErrors(t *testing.T) {
 		t.Fatalf("mkdir tmp path: %v", err)
 	}
 
-	manifest := &mergeManifest{Status: manifestStatusWriting}
+	manifest := &mergeManifest{Phase: phaseRewriting}
 	if err := writeMergeManifest(dir, manifest); err == nil {
 		t.Fatal("writeMergeManifest should fail when tmp path is not writable")
 	}

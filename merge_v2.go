@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/nutsdb/nutsdb/internal/core"
@@ -87,6 +88,12 @@ type mergeOutput struct {
 // committed. A non-nil error stops the merge there, as if the process had died.
 var mergeV2TestHookCommitted func() error
 
+// mergeV2TestHookPhase, when set by a test, runs every time the manifest
+// reaches a new phase. Returning an error aborts the merge as if the process
+// had crashed at that boundary, leaving the persisted manifest on disk for the
+// recovery path to handle.
+var mergeV2TestHookPhase func(phase mergePhase) error
+
 // mergeV2 executes the complete merge operation using the V2 algorithm.
 // This is the main entry point for the merge process, orchestrating all phases.
 func (db *DB) mergeV2() error {
@@ -103,7 +110,12 @@ func (db *DB) mergeV2() error {
 		return job.abort(err)
 	}
 
-	// Rewrite phase - process all pending files and create merge outputs
+	// Rewrite phase - process all pending files and create merge outputs.
+	// Persist the phase first so a crash while an output is open is treated
+	// as an interrupted rewrite and rolled back, not as a committed switch.
+	if err := job.persistPhase(phaseRewriting); err != nil {
+		return job.abort(err)
+	}
 	if err := job.rewrite(); err != nil {
 		return job.abort(err)
 	}
@@ -119,6 +131,9 @@ func (db *DB) mergeV2() error {
 	if err := job.finalizeOutputs(); err != nil {
 		return job.abort(err)
 	}
+	if err := job.persistPhase(phaseFinalizing); err != nil {
+		return job.abort(err)
+	}
 
 	// Commit phase - mark the merge committed and update indexes
 	if err := job.commit(); err != nil {
@@ -130,7 +145,9 @@ func (db *DB) mergeV2() error {
 		}
 	}
 
-	// Clean up old files to reclaim disk space
+	// Clean up old files to reclaim disk space. The manifest stays on disk
+	// through the cleanup and moves to the cleaned phase first, so a crash
+	// here is resolved idempotently on the next Open.
 	if err := job.cleanupOldFiles(); err != nil {
 		return fmt.Errorf("cleanup old files: %w", err)
 	}
@@ -216,16 +233,19 @@ func (job *mergeV2Job) finish() {
 }
 
 // enterWritingState initializes the merge job for writing entries.
-// Creates the merge manifest and prepares necessary data structures.
+// Creates the merge manifest at the preparing phase: from this point on a
+// crash is recoverable and the pending old files must not be deleted.
 func (job *mergeV2Job) enterWritingState() error {
 	// Initialize lookup entries for tracking merged entries
 	job.lookup = make([]*mergeLookupEntry, 0)
 
-	// Create merge manifest to track merge progress
+	// Create merge manifest to track merge progress. No output exists yet,
+	// so a crash in this state only requires dropping the manifest.
 	job.manifest = &mergeManifest{
-		Status:            manifestStatusWriting,
+		Phase:             phasePreparing,
 		MergeSeqMax:       -1,
 		PendingOldFileIDs: append([]int64(nil), job.pending...),
+		Outputs:           nil,
 	}
 
 	// Initialize value hasher for Set/SortedSet duplicate detection
@@ -236,6 +256,22 @@ func (job *mergeV2Job) enterWritingState() error {
 	// Write initial manifest to enable recovery
 	if err := writeMergeManifest(job.db.opt.Dir, job.manifest); err != nil {
 		return err
+	}
+	return nil
+}
+
+// persistPhase records a pipeline transition in the manifest and fsyncs it via
+// an atomic rename. Every phase boundary goes through here, so after a
+// restart recovery always sees the last completed stage.
+func (job *mergeV2Job) persistPhase(phase mergePhase) error {
+	job.manifest.Phase = phase
+	if err := writeMergeManifest(job.db.opt.Dir, job.manifest); err != nil {
+		return err
+	}
+	if mergeV2TestHookPhase != nil {
+		if err := mergeV2TestHookPhase(phase); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -297,7 +333,7 @@ func (job *mergeV2Job) commit() error {
 	} else {
 		job.manifest.MergeSeqMax = job.outputs[len(job.outputs)-1].seq
 	}
-	job.manifest.Status = manifestStatusCommitted
+	job.manifest.Phase = phaseCommitted
 	if err := writeMergeManifest(job.db.opt.Dir, job.manifest); err != nil {
 		return err
 	}
@@ -322,10 +358,15 @@ func (job *mergeV2Job) commit() error {
 	return nil
 }
 
-// cleanupOldFiles removes the old data and hint files that were merged, as well as the manifest file.
-// This is called after a successful merge to reclaim disk space.
+// cleanupOldFiles removes the old data and hint files that were merged. The
+// manifest has already reached the committed phase, so the switch is durable.
+// The cleaned phase is persisted before the manifest is removed: if the
+// process dies between the two writes, the next Open sees phaseCleaned and
+// simply drops the manifest instead of redoing the work.
 func (job *mergeV2Job) cleanupOldFiles() error {
-	// Close and remove old data files
+	// Close and remove old data files. These are still referenced by in-memory
+	// indexes up to this point, so closing them in the FDM only happens here,
+	// after the committed manifest made the merge outputs authoritative.
 	for _, path := range job.oldData {
 		_ = job.db.fm.fdm.CloseByPath(path)
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -338,30 +379,65 @@ func (job *mergeV2Job) cleanupOldFiles() error {
 			return err
 		}
 	}
+
+	// Record that the old files are gone. Recovery from here is a no-op apart
+	// from removing the manifest itself.
+	job.manifest.Phase = phaseCleaned
+	if err := writeMergeManifest(job.db.opt.Dir, job.manifest); err != nil {
+		return err
+	}
+
 	// Remove the merge manifest file
 	return removeMergeManifest(job.db.opt.Dir)
 }
 
 // abort cleans up all created files when a merge fails and returns the original error.
-// It ensures no partial merge state is left behind and combines any cleanup errors.
+// It only removes files that this merge created: the outputs enumerated in the
+// manifest plus any handle that never made it into the manifest. Pending old
+// files and any file outside the manifest are left untouched, returning the
+// directory to its pre-merge state.
 func (job *mergeV2Job) abort(err error) error {
 	var errs []error
 
-	// Clean up all output files created during the failed merge
+	// Finalize handles so their mappings are released before unlinking.
 	for _, out := range job.outputs {
-		if out != nil {
+		if out != nil && !out.finalized {
 			if finalizeErr := out.finalize(); finalizeErr != nil {
 				errs = append(errs, fmt.Errorf("failed to finalize output %d: %w", out.seq, finalizeErr))
 			}
-			if out.dataPath != "" {
-				if removeErr := os.Remove(out.dataPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-					errs = append(errs, fmt.Errorf("failed to remove data file %s: %w", out.dataPath, removeErr))
-				}
+		}
+	}
+
+	// Remove exactly the outputs recorded in the manifest. On a real crash
+	// recovery uses this same list; abort mirrors it for an in-process
+	// failure so the two paths cannot diverge.
+	if job.manifest != nil {
+		if removeErr := removeManifestOutputs(job.db.opt.Dir, job.manifest); removeErr != nil {
+			errs = append(errs, removeErr)
+		}
+	}
+
+	// Defensive cleanup for an output created but never registered in the
+	// manifest (e.g. failure while persisting the manifest inside newOutput).
+	registered := make(map[string]struct{})
+	if job.manifest != nil {
+		for _, o := range job.manifest.Outputs {
+			registered[o.Data] = struct{}{}
+			registered[o.Hint] = struct{}{}
+		}
+	}
+	for _, out := range job.outputs {
+		if out == nil {
+			continue
+		}
+		if _, ok := registered[out.dataPath]; !ok && out.dataPath != "" {
+			if removeErr := os.Remove(out.dataPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("failed to remove data file %s: %w", out.dataPath, removeErr))
 			}
-			if out.hintPath != "" {
-				if removeErr := os.Remove(out.hintPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-					errs = append(errs, fmt.Errorf("failed to remove hint file %s: %w", out.hintPath, removeErr))
-				}
+		}
+		if _, ok := registered[out.hintPath]; !ok && out.hintPath != "" {
+			if removeErr := os.Remove(out.hintPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("failed to remove hint file %s: %w", out.hintPath, removeErr))
 			}
 		}
 	}
@@ -532,14 +608,16 @@ func (job *mergeV2Job) ensureOutput(size int64) (*mergeOutput, error) {
 }
 
 // newOutput creates a new merge output file with associated hint file collector.
-// It generates unique file IDs using merge sequence numbers and cleans up any existing files.
+// It generates unique file IDs using merge sequence numbers, cleans up any stale
+// files at those paths from a previous run, and registers the new output in the
+// manifest so recovery can remove it if the process dies during the rewrite.
 func (job *mergeV2Job) newOutput() (*mergeOutput, error) {
 	seq := job.outputSeqBase + len(job.outputs)
 	fileID := GetMergeFileID(seq)
 	dataPath := getMergeDataPath(job.db.opt.Dir, seq)
 	hintPath := getMergeHintPath(job.db.opt.Dir, seq)
 
-	// Clean up any existing files from previous failed merges
+	// Clean up any existing files from previous failed merges at this seq.
 	if err := os.Remove(dataPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("failed to remove old data file %s: %w", dataPath, err)
 	}
@@ -556,7 +634,8 @@ func (job *mergeV2Job) newOutput() (*mergeOutput, error) {
 	// Create hint file writer and collector if hint files are enabled
 	var hintWriter *HintFileWriter
 	var collector *HintCollector
-	if job.db.opt.EnableHintFile {
+	hasHint := job.db.opt.EnableHintFile
+	if hasHint {
 		hintWriter = &HintFileWriter{}
 		if err := hintWriter.Create(hintPath); err != nil {
 			// If hint writer creation fails, clean up the created data file
@@ -576,6 +655,36 @@ func (job *mergeV2Job) newOutput() (*mergeOutput, error) {
 		hintPath:  hintPath,
 	}
 	job.outputs = append(job.outputs, out)
+
+	// Register the output in the manifest before any entry is written to it.
+	// The manifest only stores basenames so it remains portable if the data
+	// directory is relocated during a backup restore.
+	if job.manifest != nil {
+		job.manifest.Outputs = append(job.manifest.Outputs, mergeManifestOutput{
+			Seq:     seq,
+			Data:    filepath.Base(dataPath),
+			Hint:    filepath.Base(hintPath),
+			FileID:  fileID,
+			HasHint: hasHint,
+		})
+		// The manifest is in the rewriting phase for the whole rewrite; the
+		// persistence makes the new output discoverable by recovery.
+		if job.manifest.Phase == phasePreparing {
+			job.manifest.Phase = phaseRewriting
+		}
+		if err := writeMergeManifest(job.db.opt.Dir, job.manifest); err != nil {
+			// The output never made it into a durable manifest, so recovery
+			// would not know about it. Roll it back immediately.
+			job.manifest.Outputs = job.manifest.Outputs[:len(job.manifest.Outputs)-1]
+			_ = dataFile.Close()
+			_ = os.Remove(dataPath)
+			if hasHint {
+				_ = os.Remove(hintPath)
+			}
+			job.outputs = job.outputs[:len(job.outputs)-1]
+			return nil, fmt.Errorf("register merge output in manifest: %w", err)
+		}
+	}
 	return out, nil
 }
 
